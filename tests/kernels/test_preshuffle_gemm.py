@@ -497,12 +497,12 @@ if __name__ == "__main__":
                         choices=["fp8", "int8", "int4", "fp16", "bf16", "fp4"])
     parser.add_argument("--out_dtype", type=str, default="bf16", choices=["fp16", "bf16"],
                         help="Output dtype (default: bf16).")
-    parser.add_argument("-M", type=int, default=8192)
-    parser.add_argument("-N", type=int, default=8192)
-    parser.add_argument("-K", type=int, default=8192)
-    parser.add_argument("--tile_m", type=int, default=16)
-    parser.add_argument("--tile_n", type=int, default=64)
-    parser.add_argument("--tile_k", type=int, default=256)
+    parser.add_argument("-M", type=int, default=1024*12)
+    parser.add_argument("-N", type=int, default=1024*12)
+    parser.add_argument("-K", type=int, default=1024*12)
+    parser.add_argument("--tile_m", type=int, default=256)
+    parser.add_argument("--tile_n", type=int, default=256)
+    parser.add_argument("--tile_k", type=int, default=128)
     parser.add_argument("--lds_stage", type=int, default=DEFAULT_LDS_STAGE, choices=[1, 2])
     parser.add_argument("--dsrd_preload", type=int, default=2)
     parser.add_argument("--dvmem_preload", type=int, default=2)
@@ -517,7 +517,7 @@ if __name__ == "__main__":
     parser.add_argument("--test_graph", "-tg", action="store_true", default=False)
     parser.add_argument("--wfp4", action="store_true", default=False,
                         help="Run weight-fp4 (MXFP4) preshuffle GEMM test.")
-    parser.add_argument("--interleaved", action="store_true", default=True,
+    parser.add_argument("--interleaved", action="store_true", default=False,
                         help="Run interleaved 4-wave FP8 GEMM (256x256x128 tiling, fp8 only).")
     args = parser.parse_args()
     torch.set_default_device("cuda")

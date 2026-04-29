@@ -106,9 +106,6 @@ def compile_interleaved_gemm_fp8_4wave(
 
         a_rsrc = buffer_ops.create_buffer_resource(arg_a, max_size=True)
         b_rsrc = buffer_ops.create_buffer_resource(arg_b, max_size=True)
-        c_rsrc = buffer_ops.create_buffer_resource(arg_c, max_size=True)
-        scale_a_rsrc = buffer_ops.create_buffer_resource(arg_scale_a, max_size=False)
-        scale_b_rsrc = buffer_ops.create_buffer_resource(arg_scale_b, max_size=False)
 
         tx = gpu.thread_id("x")
         bx = gpu.block_id("x")
@@ -146,9 +143,15 @@ def compile_interleaved_gemm_fp8_4wave(
             s = swz_flat(row, col)
             return s // c128, s % c128
 
-        # ---- LDS read ----
+        # ---- LDS read with swizzle_xor16 (same as preshuffle, simpler codegen) ----
+        _lds_k = fx.Index(lds_k_dim)
+        _kb16 = fx.Index(lds_k_dim // 16)
+        _kb16_mask = _kb16 - fx.Index(1)
+
         def lds_packs_k64(row, col_bytes, lds_buf):
-            idx = swz_flat(row, col_bytes)
+            rem = fx.arith.andi(row, _kb16_mask)
+            col_swz = col_bytes ^ (rem * c16)
+            idx = row * _lds_k + col_swz
             v16 = Vec.load(_vec16_ty, lds_buf, [idx])
             i64x2 = Vec(v16).bitcast(fx.Int64)
             return i64x2[0].ir_value(), i64x2[1].ir_value()
@@ -168,41 +171,40 @@ def compile_interleaved_gemm_fp8_4wave(
                 frags.append(pack4(a0, a1, a2, a3))
             return frags
 
-        # ---- DMA (with swizzle_128 on global address) ----
-        def _compute_global_offset(base_row, base_k, step, half_idx):
+        # ---- Pre-compute DMA offsets ONCE (swizzle_xor16 on global addr) ----
+        _K_idx = fx.Index(K)
+        _global_dma_offsets = []
+        for step in range_constexpr(4):
             local_row = _lane_div_8 + wave_id * fx.Index(8) + fx.Index(step * 32)
             col = _lane_mod_8 * c16
-            sr, sc = swz_rc(local_row, col)
-            global_row = base_row + fx.Index(half_idx * half_rows) + sr
-            return fx.Int32(global_row * fx.Index(K) + base_k + sc)
+            rem = fx.arith.andi(local_row, _kb16_mask)
+            col_swz = col ^ (rem * c16)
+            _global_dma_offsets.append(local_row * _K_idx + col_swz)
 
-        def dma_half(lds_buf, rsrc, base_row, base_k, half_idx):
-            lds_base_i = memref_dialect.extract_aligned_pointer_as_index(lds_buf)
-            w_off = rocdl.readfirstlane(fx.Int64.ir_type, fx.Int64(wave_id * fx.Index(1024)))
-            ptr = buffer_ops.create_llvm_ptr(
-                fx.Int64(lds_base_i + fx.Index(half_idx * half_size)), address_space=3)
-            ptr = buffer_ops.get_element_ptr(ptr, w_off)
-            for s in range_constexpr(4):
-                g_off = _compute_global_offset(base_row, base_k, s, half_idx)
-                if const_expr(s > 0):
-                    ptr = buffer_ops.get_element_ptr(ptr, static_byte_offset=4096)
-                rocdl.raw_ptr_buffer_load_lds(
-                    rsrc, ptr, fx.Int32(dma_bytes), g_off,
-                    fx.Int32(0), fx.Int32(0), fx.Int32(1))
+        _a_base = [bx_m * _K_idx, (bx_m + fx.Index(half_rows)) * _K_idx]
+        _b_base = [by_n * _K_idx, (by_n + fx.Index(half_rows)) * _K_idx]
 
-        def prepare_dma_steps(lds_buf, rsrc, base_row, base_k, half_idx):
-            lds_base_i = memref_dialect.extract_aligned_pointer_as_index(lds_buf)
-            w_off = rocdl.readfirstlane(fx.Int64.ir_type, fx.Int64(wave_id * fx.Index(1024)))
-            ptr = buffer_ops.create_llvm_ptr(
-                fx.Int64(lds_base_i + fx.Index(half_idx * half_size)), address_space=3)
-            ptr = buffer_ops.get_element_ptr(ptr, w_off)
-            steps = []
+        w_off = rocdl.readfirstlane(fx.Int64.ir_type, fx.Int64(wave_id * fx.Index(1024)))
+
+        def _dma_step(rsrc, base_byte_off, base_k, step, lds_buf, half_idx, lds_ptr_state):
+            """Issue one DMA step. Builds LDS pointer incrementally."""
+            if const_expr(step == 0):
+                lds_base_i = memref_dialect.extract_aligned_pointer_as_index(lds_buf)
+                ptr = buffer_ops.create_llvm_ptr(
+                    fx.Int64(lds_base_i + fx.Index(half_idx * half_size)), address_space=3)
+                ptr = buffer_ops.get_element_ptr(ptr, w_off)
+                lds_ptr_state[0] = ptr
+            else:
+                lds_ptr_state[0] = buffer_ops.get_element_ptr(lds_ptr_state[0], static_byte_offset=4096)
+            g_off = fx.Int32(base_byte_off + base_k + _global_dma_offsets[step])
+            rocdl.raw_ptr_buffer_load_lds(
+                rsrc, lds_ptr_state[0], fx.Int32(dma_bytes), g_off,
+                fx.Int32(0), fx.Int32(0), fx.Int32(1))
+
+        def dma_half(rsrc, base_byte_off, base_k, lds_buf, half_idx):
+            st = [None]
             for s in range_constexpr(4):
-                g_off = _compute_global_offset(base_row, base_k, s, half_idx)
-                if const_expr(s > 0):
-                    ptr = buffer_ops.get_element_ptr(ptr, static_byte_offset=4096)
-                steps.append((rsrc, ptr, g_off))
-            return steps
+                _dma_step(rsrc, base_byte_off, base_k, s, lds_buf, half_idx, st)
 
         n_accs = 64
 
@@ -210,9 +212,12 @@ def compile_interleaved_gemm_fp8_4wave(
             return ((ci * 2 + cj) * 4 + mi) * 4 + ni
 
         def run_cluster(ci, cj, a_regs, b_regs, accs,
-                        dma_step_list, read_row_base, read_buf):
+                        dma_rsrc, dma_base_byte_off, dma_k,
+                        dma_lds_buf, dma_half_idx, do_dma,
+                        read_row_base, read_buf):
             k0_parts = {}
             next_frags = [None, None, None, None]
+            dma_ptr_st = [None]
             for grp in range_constexpr(10):
                 mfmas = _cluster_schedule[grp][0]
                 dma_i = _cluster_schedule[grp][1]
@@ -223,11 +228,9 @@ def compile_interleaved_gemm_fp8_4wave(
                         mfma_res_ty,
                         [a_regs[mi], b_regs[ni], accs[ai],
                          0, 0, 0, 0x7F7F7F7F, 0, 0x7F7F7F7F])
-                if dma_i is not None and dma_step_list is not None:
-                    r, lp, go = dma_step_list[dma_i]
-                    rocdl.raw_ptr_buffer_load_lds(
-                        r, lp, fx.Int32(dma_bytes), go,
-                        fx.Int32(0), fx.Int32(0), fx.Int32(1))
+                if dma_i is not None and do_dma:
+                    _dma_step(dma_rsrc, dma_base_byte_off, dma_k,
+                              dma_i, dma_lds_buf, dma_half_idx, dma_ptr_st)
                 if read_buf is not None:
                     for fi, kh in reads:
                         row = read_row_base + fx.Index(fi * 16)
@@ -241,39 +244,69 @@ def compile_interleaved_gemm_fp8_4wave(
 
         def run_phase(accs, a_h0, b_h0, lds_a_cur, lds_b_cur, lds_a_next, lds_b_next,
                       dma_k, do_dma):
-            # HIP decomposition: read_row = half*128 + wave_idx*64 + fi*16 + lane_mod_16
-            # Cluster 1: c[0][0], DMA A_cur half0, read b[1] from B_cur[1]
-            dma0 = prepare_dma_steps(lds_a_cur, a_rsrc, bx_m, dma_k, 0) if do_dma else None
             b_h1_row = fx.Index(128) + wave_j * fx.Index(64) + lane_mod_16
-            accs, b_h1 = run_cluster(0, 0, a_h0, b_h0, accs, dma0, b_h1_row, lds_b_cur)
+            accs, b_h1 = run_cluster(0, 0, a_h0, b_h0, accs,
+                                     a_rsrc, _a_base[0], dma_k,
+                                     lds_a_cur, 0, do_dma,
+                                     b_h1_row, lds_b_cur)
 
-            rocdl.sched_barrier(0)
-
-            # Cluster 2: c[0][1], DMA B_cur half0, read a[1] from A_cur[1]
-            dma1 = prepare_dma_steps(lds_b_cur, b_rsrc, by_n, dma_k, 0) if do_dma else None
             a_h1_row = fx.Index(128) + wave_i * fx.Index(64) + lane_mod_16
-            accs, a_h1 = run_cluster(0, 1, a_h0, b_h1, accs, dma1, a_h1_row, lds_a_cur)
+            accs, a_h1 = run_cluster(0, 1, a_h0, b_h1, accs,
+                                     b_rsrc, _b_base[0], dma_k,
+                                     lds_b_cur, 0, do_dma,
+                                     a_h1_row, lds_a_cur)
 
-            rocdl.sched_barrier(0)
             if const_expr(do_dma):
                 rocdl.s_waitcnt(16)
                 gpu.barrier()
             rocdl.s_waitcnt(0)
-            rocdl.sched_barrier(0)
 
-            # Cluster 3: c[1][0], DMA B_cur half1, read a[0] from A_next[0]
-            dma2 = prepare_dma_steps(lds_b_cur, b_rsrc, by_n, dma_k, 1) if do_dma else None
             a_next_row = wave_i * fx.Index(64) + lane_mod_16
-            accs, a_next_h0 = run_cluster(1, 0, a_h1, b_h0, accs, dma2, a_next_row, lds_a_next)
+            accs, a_next_h0 = run_cluster(1, 0, a_h1, b_h0, accs,
+                                          b_rsrc, _b_base[1], dma_k,
+                                          lds_b_cur, 1, do_dma,
+                                          a_next_row, lds_a_next)
 
-            # Cluster 4: c[1][1], DMA A_cur half1, read b[0] from B_next[0]
-            dma3 = prepare_dma_steps(lds_a_cur, a_rsrc, bx_m, dma_k, 1) if do_dma else None
             b_next_row = wave_j * fx.Index(64) + lane_mod_16
-            accs, b_next_h0 = run_cluster(1, 1, a_h1, b_h1, accs, dma3, b_next_row, lds_b_next)
+            accs, b_next_h0 = run_cluster(1, 1, a_h1, b_h1, accs,
+                                          a_rsrc, _a_base[1], dma_k,
+                                          lds_a_cur, 1, do_dma,
+                                          b_next_row, lds_b_next)
             return accs, a_next_h0, b_next_h0
 
         # ---- Store with per-row scaling (HIP store_rt_scaled decomposition) ----
         # HIP: base_row = tile_i*BLOCK_M + wave_i*64
+        # ---- hot_loop_scheduler: control MFMA/VMEM/DSRD interleaving ----
+        # Per run_phase: 64 MFMAs, 16 DMA (vmem), 32 LDS reads (dsrd)
+        _mfma_total = 64
+        _num_vmem = 16
+        _num_dsrd = 32
+
+        def _build_schedule(numer, denom):
+            if denom <= 0:
+                return [0] * max(denom, 0)
+            out = []
+            prev = 0
+            for i in range_constexpr(denom):
+                cur = ((i + 1) * numer + (denom - 1)) // denom
+                out.append(cur - prev)
+                prev = cur
+            return out
+
+        _vmem_schedule = _build_schedule(_num_vmem, _mfma_total)
+        _dsrd_schedule = _build_schedule(_num_dsrd, _mfma_total)
+
+        def hot_loop_scheduler():
+            for mfma_idx in range_constexpr(_mfma_total):
+                rocdl.sched_mfma(1)
+                n_dsrd = _dsrd_schedule[mfma_idx]
+                if const_expr(n_dsrd > 0):
+                    rocdl.sched_dsrd(n_dsrd)
+                n_vmem = _vmem_schedule[mfma_idx]
+                if const_expr(n_vmem > 0):
+                    rocdl.sched_vmem(n_vmem)
+            rocdl.sched_barrier(0)
+
         #      c[ci][cj] stored at (base_row + ci*128, base_col + cj*128)
         def prefetch_scales():
             s_b = []
@@ -308,35 +341,61 @@ def compile_interleaved_gemm_fp8_4wave(
         k0 = fx.Index(0)
         k1 = fx.Index(tile_k)
 
-        dma_half(lds_a_pong, a_rsrc, bx_m, k0, 0)    # A_lds[cur][0]  → wait 28
-        dma_half(lds_b_pong, b_rsrc, by_n, k0, 0)     # B_lds[cur][0]  → wait 24
-        dma_half(lds_b_pong, b_rsrc, by_n, k0, 1)     # B_lds[cur][1]  → wait 20
-        dma_half(lds_a_pong, a_rsrc, bx_m, k0, 1)    # A_lds[cur][1]  → wait 16
-        dma_half(lds_a_ping, a_rsrc, bx_m, k1, 0)    # A_lds[next][0] → wait 12
-        dma_half(lds_b_ping, b_rsrc, by_n, k1, 0)     # B_lds[next][0] → wait 8
-        dma_half(lds_b_ping, b_rsrc, by_n, k1, 1)     # B_lds[next][1] → wait 4
-        dma_half(lds_a_ping, a_rsrc, bx_m, k1, 1)    # A_lds[next][1] → wait 0
+        dma_half(a_rsrc, _a_base[0], k0, lds_a_pong, 0)
+        dma_half(b_rsrc, _b_base[0], k0, lds_b_pong, 0)
+        dma_half(b_rsrc, _b_base[1], k0, lds_b_pong, 1)
+        dma_half(a_rsrc, _a_base[1], k0, lds_a_pong, 1)
+        dma_half(a_rsrc, _a_base[0], k1, lds_a_ping, 0)
+        dma_half(b_rsrc, _b_base[0], k1, lds_b_ping, 0)
+        dma_half(b_rsrc, _b_base[1], k1, lds_b_ping, 1)
+        dma_half(a_rsrc, _a_base[1], k1, lds_a_ping, 1)
 
         rocdl.sched_barrier(0)
         rocdl.s_waitcnt(28)
         gpu.barrier()
         rocdl.sched_barrier(0)
 
-        a_h0 = load_rt(lds_a_pong, wave_i, 0)   # a[0] from A_lds[cur][0]
-
-        rocdl.sched_barrier(0)
-        rocdl.s_waitcnt(24)
-        gpu.barrier()
-        rocdl.sched_barrier(0)
-
-        b_h0 = load_rt(lds_b_pong, wave_j, 0)   # b[0] from B_lds[cur][0]
-
         accs = [acc_init] * n_accs
 
         num_groups = K // (tile_k * 2)
         main_iters = num_groups - 1
 
-        # ==== Main loop ====
+        # ==== Flat compute: all MFMAs for one buffer, then DMA ====
+        def compute_flat(accs, lds_a, lds_b):
+            """Load all register tiles from LDS, then compute all 64 MFMAs."""
+            a0 = load_rt(lds_a, wave_i, 0)
+            a1 = load_rt(lds_a, wave_i, 1)
+            b0 = load_rt(lds_b, wave_j, 0)
+            b1 = load_rt(lds_b, wave_j, 1)
+            for i in range_constexpr(4):
+                for j in range_constexpr(4):
+                    accs[acc_idx(0, 0, i, j)] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        mfma_res_ty, [a0[i], b0[j], accs[acc_idx(0, 0, i, j)],
+                         0, 0, 0, 0x7F7F7F7F, 0, 0x7F7F7F7F])
+            for i in range_constexpr(4):
+                for j in range_constexpr(4):
+                    accs[acc_idx(0, 1, i, j)] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        mfma_res_ty, [a0[i], b1[j], accs[acc_idx(0, 1, i, j)],
+                         0, 0, 0, 0x7F7F7F7F, 0, 0x7F7F7F7F])
+            for i in range_constexpr(4):
+                for j in range_constexpr(4):
+                    accs[acc_idx(1, 0, i, j)] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        mfma_res_ty, [a1[i], b0[j], accs[acc_idx(1, 0, i, j)],
+                         0, 0, 0, 0x7F7F7F7F, 0, 0x7F7F7F7F])
+            for i in range_constexpr(4):
+                for j in range_constexpr(4):
+                    accs[acc_idx(1, 1, i, j)] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        mfma_res_ty, [a1[i], b1[j], accs[acc_idx(1, 1, i, j)],
+                         0, 0, 0, 0x7F7F7F7F, 0, 0x7F7F7F7F])
+
+        def dma_tile(lds_a, lds_b, k_off):
+            """DMA one full A+B tile to LDS."""
+            dma_half(a_rsrc, _a_base[0], k_off, lds_a, 0)
+            dma_half(a_rsrc, _a_base[1], k_off, lds_a, 1)
+            dma_half(b_rsrc, _b_base[0], k_off, lds_b, 0)
+            dma_half(b_rsrc, _b_base[1], k_off, lds_b, 1)
+
+        # ==== Main loop (preshuffle-style: flat compute + DMA) ====
         if const_expr(main_iters > 0):
             init_state = list(accs)
             results = init_state
@@ -346,39 +405,24 @@ def compile_interleaved_gemm_fp8_4wave(
             for k_iv, inner in range(0, main_iters * tile_k * 2, tile_k * 2, init=init_state):
                 accs_in = list(inner)
 
+                # Phase 1: compute on pong
                 rocdl.s_waitcnt(0)
                 gpu.barrier()
-                ah0_in = load_rt(lds_a_pong, wave_i, 0)
-                bh0_in = load_rt(lds_b_pong, wave_j, 0)
-
-                dma_k_pong = k_iv + fx.Index(tile_k * 2)
-                accs_in, ah1_in, bh1_in = run_phase(
-                    accs_in, ah0_in, bh0_in,
-                    lds_a_pong, lds_b_pong, lds_a_ping, lds_b_ping,
-                    dma_k_pong, True)
+                compute_flat(accs_in, lds_a_pong, lds_b_pong)
+                dma_tile(lds_a_pong, lds_b_pong, k_iv + fx.Index(tile_k * 2))
+                hot_loop_scheduler()
                 rocdl.s_waitcnt(0)
                 gpu.barrier()
 
-                dma_k_ping = k_iv + fx.Index(tile_k * 3)
-                accs_in, _, _ = run_phase(
-                    accs_in, ah1_in, bh1_in,
-                    lds_a_ping, lds_b_ping, lds_a_pong, lds_b_pong,
-                    dma_k_ping, True)
+                # Phase 2: compute on ping
+                compute_flat(accs_in, lds_a_ping, lds_b_ping)
+                dma_tile(lds_a_ping, lds_b_ping, k_iv + fx.Index(tile_k * 3))
+                hot_loop_scheduler()
 
                 results = yield list(accs_in)
 
             SmemPtr._view_cache = None
             accs = list(results)
-
-        # ==== Helpers for epilogue ====
-        def mfma_all_quad(accs, ci, cj, a_frags, b_frags):
-            for i in range_constexpr(4):
-                for j in range_constexpr(4):
-                    ai = acc_idx(ci, cj, i, j)
-                    accs[ai] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                        mfma_res_ty,
-                        [a_frags[i], b_frags[j], accs[ai],
-                         0, 0, 0, 0x7F7F7F7F, 0, 0x7F7F7F7F])
 
         def store_quad_scaled(accs, ci, cj, s_a_list, s_b_list):
             base_row = bx_m + wave_i * fx.Index(64)
@@ -396,92 +440,24 @@ def compile_interleaved_gemm_fp8_4wave(
                         out_val = _out_dt()(val * (s_a * s_b))
                         buffer_ops.buffer_store(out_val, c_rsrc, idx_base + (ni * 16))
 
-        # ==== Epilogue k_iters-2: compute without DMA (matching HIP) ====
-        rocdl.sched_barrier(0)
-        rocdl.s_waitcnt(16)
+        # ==== Epilogue k_iters-2: flat compute on pong ====
+        rocdl.s_waitcnt(0)
         gpu.barrier()
-        rocdl.sched_barrier(0)
-        rocdl.s_waitcnt(0)
-        rocdl.sched_barrier(0)
+        compute_flat(accs, lds_a_pong, lds_b_pong)
 
-        b1 = load_rt(lds_b_pong, wave_j, 1)       # b[1] from B_cur[1]
-
-        rocdl.sched_barrier(0)
-        mfma_all_quad(accs, 0, 0, a_h0, b_h0)
-        rocdl.sched_barrier(0)
-
-        rocdl.s_waitcnt(0)
-        rocdl.sched_barrier(0)
-
-        a1 = load_rt(lds_a_pong, wave_i, 1)        # a[1] from A_cur[1]
-
-        rocdl.sched_barrier(0)
-        mfma_all_quad(accs, 0, 1, a_h0, b1)
-        rocdl.sched_barrier(0)
-
-        rocdl.s_waitcnt(8)
-        gpu.barrier()
-        rocdl.sched_barrier(0)
-        rocdl.s_waitcnt(0)
-        rocdl.sched_barrier(0)
-
-        a_h0 = load_rt(lds_a_ping, wave_i, 0)      # a[0] from A_next[0]
-
-        rocdl.sched_barrier(0)
-        mfma_all_quad(accs, 1, 0, a1, b_h0)
-        rocdl.sched_barrier(0)
-
-        b_h0 = load_rt(lds_b_ping, wave_j, 0)      # b[0] from B_next[0]
-
-        rocdl.sched_barrier(0)
-        mfma_all_quad(accs, 1, 1, a1, b1)
-        rocdl.sched_barrier(0)
-
-        # ==== Epilogue k_iters-1: compute + interleaved store (matching HIP) ====
-        # Prefetch scales — hidden behind the 64 MFMAs below
+        # ==== Epilogue k_iters-1: flat compute on ping + interleaved store ====
+        c_rsrc = buffer_ops.create_buffer_resource(arg_c, max_size=True)
+        scale_a_rsrc = buffer_ops.create_buffer_resource(arg_scale_a, max_size=False)
+        scale_b_rsrc = buffer_ops.create_buffer_resource(arg_scale_b, max_size=False)
         s_a_list, s_b_list = prefetch_scales()
 
-        rocdl.sched_barrier(0)
         rocdl.s_waitcnt(0)
         gpu.barrier()
-        rocdl.sched_barrier(0)
-        rocdl.s_waitcnt(0)
-        rocdl.sched_barrier(0)
-
-        b1 = load_rt(lds_b_ping, wave_j, 1)        # b[1] from B_cur[1]
-
-        rocdl.sched_barrier(0)
-        mfma_all_quad(accs, 0, 0, a_h0, b_h0)
-        rocdl.sched_barrier(0)
+        compute_flat(accs, lds_a_ping, lds_b_ping)
 
         store_quad_scaled(accs, 0, 0, s_a_list, s_b_list)
-
-        rocdl.sched_barrier(0)
-        rocdl.s_waitcnt(0)
-        rocdl.sched_barrier(0)
-
-        a1 = load_rt(lds_a_ping, wave_i, 1)        # a[1] from A_cur[1]
-
-        rocdl.sched_barrier(0)
-        mfma_all_quad(accs, 0, 1, a_h0, b1)
-        rocdl.sched_barrier(0)
-
         store_quad_scaled(accs, 0, 1, s_a_list, s_b_list)
-
-        rocdl.sched_barrier(0)
-        rocdl.s_waitcnt(0)
-        rocdl.sched_barrier(0)
-
-        rocdl.sched_barrier(0)
-        mfma_all_quad(accs, 1, 0, a1, b_h0)
-        rocdl.sched_barrier(0)
-
         store_quad_scaled(accs, 1, 0, s_a_list, s_b_list)
-
-        rocdl.sched_barrier(0)
-        mfma_all_quad(accs, 1, 1, a1, b1)
-        rocdl.sched_barrier(0)
-
         store_quad_scaled(accs, 1, 1, s_a_list, s_b_list)
 
     @flyc.jit
