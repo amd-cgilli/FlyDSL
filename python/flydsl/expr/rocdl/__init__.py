@@ -31,6 +31,10 @@ _ods_cluster_load_async_to_lds_b64 = cluster_load_async_to_lds_b64
 _ods_cluster_load_async_to_lds_b128 = cluster_load_async_to_lds_b128
 _ods_s_wait_asynccnt = s_wait_asynccnt
 _ods_readfirstlane = readfirstlane
+_ods_mfma_f32_32x32x8f16 = globals().get("mfma_f32_32x32x8f16", None)
+_ods_mfma_f32_32x32x8bf16_1k = globals().get("mfma_f32_32x32x8bf16_1k", None)
+_ods_mfma_f32_32x32x16_f16 = globals().get("mfma_f32_32x32x16_f16", None)
+_ods_mfma_f32_32x32x16_bf16 = globals().get("mfma_f32_32x32x16_bf16", None)
 _ods_mfma_f32_16x16x16f16 = mfma_f32_16x16x16f16
 _ods_mfma_f32_16x16x16bf16_1k = globals().get("mfma_f32_16x16x16bf16_1k", None)
 _ods_mfma_f32_16x16x32_fp8_fp8 = mfma_f32_16x16x32_fp8_fp8
@@ -86,6 +90,38 @@ def _split_mfma_operands(operands, *, loc=None):
     abid = int(operands[4]) if len(operands) > 4 else 0
     blgp = int(operands[5]) if len(operands) > 5 else 0
     return a, b, c, cbsz, abid, blgp
+
+
+@traced_op
+def mfma_f32_32x32x8f16(result_type, operands, *, loc=None, ip=None):
+    if _ods_mfma_f32_32x32x8f16 is None:
+        raise AttributeError("ROCDL op not found: mfma_f32_32x32x8f16")
+    a, b, c, cbsz, abid, blgp = _split_mfma_operands(operands, loc=loc)
+    return _ods_mfma_f32_32x32x8f16(result_type, a, b, c, cbsz, abid, blgp, loc=loc, ip=ip).result
+
+
+@traced_op
+def mfma_f32_32x32x8bf16_1k(result_type, operands, *, loc=None, ip=None):
+    if _ods_mfma_f32_32x32x8bf16_1k is None:
+        raise AttributeError("ROCDL op not found: mfma_f32_32x32x8bf16_1k")
+    a, b, c, cbsz, abid, blgp = _split_mfma_operands(operands, loc=loc)
+    return _ods_mfma_f32_32x32x8bf16_1k(result_type, a, b, c, cbsz, abid, blgp, loc=loc, ip=ip).result
+
+
+@traced_op
+def mfma_f32_32x32x16_f16(result_type, operands, *, loc=None, ip=None):
+    if _ods_mfma_f32_32x32x16_f16 is None:
+        raise AttributeError("ROCDL op not found: mfma_f32_32x32x16_f16")
+    a, b, c, cbsz, abid, blgp = _split_mfma_operands(operands, loc=loc)
+    return _ods_mfma_f32_32x32x16_f16(result_type, a, b, c, cbsz, abid, blgp, loc=loc, ip=ip).result
+
+
+@traced_op
+def mfma_f32_32x32x16_bf16(result_type, operands, *, loc=None, ip=None):
+    if _ods_mfma_f32_32x32x16_bf16 is None:
+        raise AttributeError("ROCDL op not found: mfma_f32_32x32x16_bf16")
+    a, b, c, cbsz, abid, blgp = _split_mfma_operands(operands, loc=loc)
+    return _ods_mfma_f32_32x32x16_bf16(result_type, a, b, c, cbsz, abid, blgp, loc=loc, ip=ip).result
 
 
 @traced_op
@@ -407,7 +443,12 @@ from .inline_asm import *  # noqa: E402,F401,F403,I001
 def _to_ir(v):
     """Coerce DSL Numeric to ir.Value if needed."""
     from ..._mlir import ir as _ir
+    from .. import arith as _arith_ext
 
+    if isinstance(v, int):
+        return _arith_ext.unwrap(_arith_ext.constant(v, type=_ir.IntegerType.get_signless(32)))
+    if isinstance(v, float):
+        return _arith_ext.unwrap(_arith_ext.constant(v, type=_ir.F32Type.get()))
     if not isinstance(v, _ir.Value) and hasattr(v, "ir_value"):
         return v.ir_value()
     return v
@@ -431,12 +472,49 @@ def cvt_pk_fp8_f32(res, src_a, src_b, old, word_sel, **kw):
     return _op(res=res, src_a=_to_ir(src_a), src_b=_to_ir(src_b), old=_to_ir(old), word_sel=word_sel, **kw)
 
 
+def rcp(res, arg, **kw):
+    from ..._mlir.dialects.rocdl import rcp as _op
+
+    return _op(res=res, arg=_to_ir(arg), **kw)
+
+
+def perm_b32(src_hi, src_lo, sel, **kw):
+    """Wrapper for ``llvm.amdgcn.perm`` returning one i32 lane value."""
+    from ..._mlir.dialects import llvm as _llvm
+    from ..typing import T
+
+    return _llvm.call_intrinsic(
+        T.i32,
+        "llvm.amdgcn.perm",
+        [_to_ir(src_hi), _to_ir(src_lo), _to_ir(sel)],
+        [],
+        [],
+        **kw,
+    )
+
+
 def raw_ptr_buffer_load_lds(rsrc, lds_ptr, size, voffset, soffset, offset, aux, **kw):
     from ..._mlir.dialects.rocdl import raw_ptr_buffer_load_lds as _op
 
     return _op(
         _to_ir(rsrc), _to_ir(lds_ptr), _to_ir(size), _to_ir(voffset), _to_ir(soffset), _to_ir(offset), _to_ir(aux), **kw
     )
+
+
+def buffer_load_to_lds(rsrc, lds_ptr, voffset, size_bytes=4, soffset=0, offset=0):
+    """Load ``size_bytes`` from a buffer resource into LDS.
+
+    Simplified wrapper around :func:`raw_ptr_buffer_load_lds` with
+    sensible defaults (``soffset=0``, ``offset=0``, ``aux=0``).
+    Python int arguments are auto-materialised as i32 constants.
+    """
+    return raw_ptr_buffer_load_lds(rsrc, lds_ptr, size_bytes, voffset, soffset, offset, 0)
+
+
+def ds_bpermute(res, index, src, **kw):
+    from ..._mlir.dialects.rocdl import ds_bpermute as _op
+
+    return _op(res=res, index=_to_ir(index), src=_to_ir(src), **kw)
 
 
 def readfirstlane(res, src, **kw):
