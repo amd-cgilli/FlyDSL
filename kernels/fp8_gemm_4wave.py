@@ -197,79 +197,86 @@ def compile_fp8_gemm_4wave(
             return c
 
         def _interleaved_cluster(lds_dst, gl_src, k_offset, gl_offsets, wave_idx, lds_src, a, b, c):
-            # Compute a 64x64 output tile using 4x4 MFMA instructions
-            # returns the updated accumulator and the next fragment loaded from lds_src
-            rt_dst = []
-
-            rocdl.sched_barrier(0)
-            c = _mfma_ABt(a, b, c, 0, 0)
-            c = _mfma_ABt(a, b, c, 0, 1)
-            rocdl.sched_barrier(0)
-
-            lds_swz = _compute_lds_swizzle(wave_idx)
-            _load_one_lds(gl_src, lds_dst, k_offset, gl_offsets, 0)
-            rt_dst_0 = _load_one_rt(lds_src, lds_swz, 0, 0)
-
-            rocdl.sched_barrier(0)
-            c = _mfma_ABt(a, b, c, 0, 2)
-            rocdl.sched_barrier(0)
-
-            rt_dst_1 = _load_one_rt(lds_src, lds_swz, 0, 1)
-            rt_dst.append(_pack_i32x42_i32x8(rt_dst_0, rt_dst_1))
-
-            rocdl.sched_barrier(0)
-            c = _mfma_ABt(a, b, c, 0, 3)
-            rocdl.sched_barrier(0)
-
-            _load_one_lds(gl_src, lds_dst, k_offset, gl_offsets, 1)
-            rt_dst_0 = _load_one_rt(lds_src, lds_swz, 1, 0)
-
-            rocdl.sched_barrier(0)
-            c = _mfma_ABt(a, b, c, 1, 0)
-            c = _mfma_ABt(a, b, c, 1, 1)
-            rocdl.sched_barrier(0)
-
-            rt_dst_1 = _load_one_rt(lds_src, lds_swz, 1, 1)
-            rt_dst.append(_pack_i32x42_i32x8(rt_dst_0, rt_dst_1))
-
-            rocdl.sched_barrier(0)
-            c = _mfma_ABt(a, b, c, 1, 2)
-            c = _mfma_ABt(a, b, c, 1, 3)
-            rocdl.sched_barrier(0)
-
-            _load_one_lds(gl_src, lds_dst, k_offset, gl_offsets, 2)
-            rt_dst_0 = _load_one_rt(lds_src, lds_swz, 2, 0)
-
-            rocdl.sched_barrier(0)
-            c = _mfma_ABt(a, b, c, 2, 0)
-            c = _mfma_ABt(a, b, c, 2, 1)
-            rocdl.sched_barrier(0)
-
-            rt_dst_1 = _load_one_rt(lds_src, lds_swz, 2, 1)
-            rt_dst.append(_pack_i32x42_i32x8(rt_dst_0, rt_dst_1))
-
-            rocdl.sched_barrier(0)
-            c = _mfma_ABt(a, b, c, 2, 2)
-            c = _mfma_ABt(a, b, c, 2, 3)
-            rocdl.sched_barrier(0)
-
-            _load_one_lds(gl_src, lds_dst, k_offset, gl_offsets, 3)
-            rt_dst_0 = _load_one_rt(lds_src, lds_swz, 3, 0)
-
-            rocdl.sched_barrier(0)
-            c = _mfma_ABt(a, b, c, 3, 0)
-            c = _mfma_ABt(a, b, c, 3, 1)
-            rocdl.sched_barrier(0)
-
-            rt_dst_1 = _load_one_rt(lds_src, lds_swz, 3, 1)
-            rt_dst.append(_pack_i32x42_i32x8(rt_dst_0, rt_dst_1))
-
-            rocdl.sched_barrier(0)
-            c = _mfma_ABt(a, b, c, 3, 2)
-            c = _mfma_ABt(a, b, c, 3, 3)
-            rocdl.sched_barrier(0)
+            c = _mfma_ABt_all(a, b, c)
+            _load_lds(gl_src, lds_dst, k_offset, gl_offsets)
+            rt_dst = _load_rt(lds_src, wave_idx)
 
             return c, rt_dst
+
+        # def _interleaved_cluster(lds_dst, gl_src, k_offset, gl_offsets, wave_idx, lds_src, a, b, c):
+        #     # Compute a 64x64 output tile using 4x4 MFMA instructions
+        #     # returns the updated accumulator and the next fragment loaded from lds_src
+        #     rt_dst = []
+
+        #     rocdl.sched_barrier(0)
+        #     c = _mfma_ABt(a, b, c, 0, 0)
+        #     c = _mfma_ABt(a, b, c, 0, 1)
+        #     rocdl.sched_barrier(0)
+
+        #     lds_swz = _compute_lds_swizzle(wave_idx)
+        #     _load_one_lds(gl_src, lds_dst, k_offset, gl_offsets, 0)
+        #     rt_dst_0 = _load_one_rt(lds_src, lds_swz, 0, 0)
+
+        #     rocdl.sched_barrier(0)
+        #     c = _mfma_ABt(a, b, c, 0, 2)
+        #     rocdl.sched_barrier(0)
+
+        #     rt_dst_1 = _load_one_rt(lds_src, lds_swz, 0, 1)
+        #     rt_dst.append(_pack_i32x42_i32x8(rt_dst_0, rt_dst_1))
+
+        #     rocdl.sched_barrier(0)
+        #     c = _mfma_ABt(a, b, c, 0, 3)
+        #     rocdl.sched_barrier(0)
+
+        #     _load_one_lds(gl_src, lds_dst, k_offset, gl_offsets, 1)
+        #     rt_dst_0 = _load_one_rt(lds_src, lds_swz, 1, 0)
+
+        #     rocdl.sched_barrier(0)
+        #     c = _mfma_ABt(a, b, c, 1, 0)
+        #     c = _mfma_ABt(a, b, c, 1, 1)
+        #     rocdl.sched_barrier(0)
+
+        #     rt_dst_1 = _load_one_rt(lds_src, lds_swz, 1, 1)
+        #     rt_dst.append(_pack_i32x42_i32x8(rt_dst_0, rt_dst_1))
+
+        #     rocdl.sched_barrier(0)
+        #     c = _mfma_ABt(a, b, c, 1, 2)
+        #     c = _mfma_ABt(a, b, c, 1, 3)
+        #     rocdl.sched_barrier(0)
+
+        #     _load_one_lds(gl_src, lds_dst, k_offset, gl_offsets, 2)
+        #     rt_dst_0 = _load_one_rt(lds_src, lds_swz, 2, 0)
+
+        #     rocdl.sched_barrier(0)
+        #     c = _mfma_ABt(a, b, c, 2, 0)
+        #     c = _mfma_ABt(a, b, c, 2, 1)
+        #     rocdl.sched_barrier(0)
+
+        #     rt_dst_1 = _load_one_rt(lds_src, lds_swz, 2, 1)
+        #     rt_dst.append(_pack_i32x42_i32x8(rt_dst_0, rt_dst_1))
+
+        #     rocdl.sched_barrier(0)
+        #     c = _mfma_ABt(a, b, c, 2, 2)
+        #     c = _mfma_ABt(a, b, c, 2, 3)
+        #     rocdl.sched_barrier(0)
+
+        #     _load_one_lds(gl_src, lds_dst, k_offset, gl_offsets, 3)
+        #     rt_dst_0 = _load_one_rt(lds_src, lds_swz, 3, 0)
+
+        #     rocdl.sched_barrier(0)
+        #     c = _mfma_ABt(a, b, c, 3, 0)
+        #     c = _mfma_ABt(a, b, c, 3, 1)
+        #     rocdl.sched_barrier(0)
+
+        #     rt_dst_1 = _load_one_rt(lds_src, lds_swz, 3, 1)
+        #     rt_dst.append(_pack_i32x42_i32x8(rt_dst_0, rt_dst_1))
+
+        #     rocdl.sched_barrier(0)
+        #     c = _mfma_ABt(a, b, c, 3, 2)
+        #     c = _mfma_ABt(a, b, c, 3, 3)
+        #     rocdl.sched_barrier(0)
+
+        #     return c, rt_dst
 
 
         A_rsrc = buffer_ops.create_buffer_resource(A)
@@ -283,7 +290,6 @@ def compile_fp8_gemm_4wave(
         c11_frag = [RT_C_i] * 16
 
         global_offsets = _compute_global_swizzle()
-        rocdl.sched_barrier(0)
 
         # Prologue: pre-load A/B cur
         _load_lds(A_rsrc, a_cur0, A0_gl_offset + 0 * BLOCK_K, global_offsets)
@@ -356,15 +362,11 @@ def compile_fp8_gemm_4wave(
 
         b1_frag = _load_rt(b_cur1, wave_j)
 
-        rocdl.sched_barrier(0)
         c00_frag = _mfma_ABt_all(a0_frag, b0_frag, c00_frag)
-        rocdl.sched_barrier(0)
 
         a1_frag = _load_rt(a_cur1, wave_i)
 
-        rocdl.sched_barrier(0)
         c01_frag = _mfma_ABt_all(a0_frag, b1_frag, c01_frag)
-        rocdl.sched_barrier(0)
 
         rocdl.sched_barrier(0)
         rocdl.s_waitcnt(8)
@@ -373,15 +375,11 @@ def compile_fp8_gemm_4wave(
 
         a0_frag = _load_rt(a_next0, wave_i)
 
-        rocdl.sched_barrier(0)
         c10_frag = _mfma_ABt_all(a1_frag, b0_frag, c10_frag)
-        rocdl.sched_barrier(0)
 
         b0_frag = _load_rt(b_next0, wave_j)
 
-        rocdl.sched_barrier(0)
         c11_frag = _mfma_ABt_all(a1_frag, b1_frag, c11_frag)
-        rocdl.sched_barrier(0)
 
         # Swap cur and next
         a_cur0, a_next0 = a_next0, a_cur0
@@ -399,32 +397,21 @@ def compile_fp8_gemm_4wave(
         rocdl.sched_barrier(0)
 
         b1_frag = _load_rt(b_cur1, wave_j)
-
-        rocdl.sched_barrier(0)
-        c00_frag = _mfma_ABt_all(a0_frag, b0_frag, c00_frag)
-        rocdl.sched_barrier(0)
-
         a1_frag = _load_rt(a_cur1, wave_i)
 
-        rocdl.sched_barrier(0)
+        c00_frag = _mfma_ABt_all(a0_frag, b0_frag, c00_frag)
+
         c01_frag = _mfma_ABt_all(a0_frag, b1_frag, c01_frag)
-        rocdl.sched_barrier(0)
 
-        rocdl.sched_barrier(0)
+
         c10_frag = _mfma_ABt_all(a1_frag, b0_frag, c10_frag)
-        rocdl.sched_barrier(0)
 
-        rocdl.sched_barrier(0)
         c11_frag = _mfma_ABt_all(a1_frag, b1_frag, c11_frag)
-        rocdl.sched_barrier(0)
 
-        # This works better than interleaving stores with the last mfma step (apparently)
         _store_rt(c00_frag, base_row + 0, base_col + 0)
         _store_rt(c01_frag, base_row + 0, base_col + 128)
         _store_rt(c10_frag, base_row + 128, base_col + 0)
         _store_rt(c11_frag, base_row + 128, base_col + 128)
-
-        rocdl.sched_barrier(0)
 
 
 
