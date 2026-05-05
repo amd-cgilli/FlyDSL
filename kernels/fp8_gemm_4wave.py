@@ -1,14 +1,25 @@
+import os
+import sys
+import time
+
 import torch
-import torch.nn.functional as F
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import buffer_ops, range_constexpr, rocdl, gpu
-from flydsl.expr.typing import BFloat16
+from flydsl._mlir.dialects import llvm as _llvm
+from flydsl.expr import buffer_ops, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
-import time
 
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+_PYFLYDSL_SRC = os.path.join(_REPO_ROOT, "flydsl", "src")
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+if _PYFLYDSL_SRC not in sys.path:
+    sys.path.insert(0, _PYFLYDSL_SRC)
+
+from tests.test_common import verify_output
+from tests.utils import pertoken_quant
 
 FP8_DTYPE = torch.float8_e4m3fn
 OUT_DTYPE = torch.bfloat16
@@ -57,7 +68,9 @@ def compile_fp8_gemm_4wave(
     def kernel_gemm(
         A: fx.Tensor,
         B_T: fx.Tensor,
-        C: fx.Tensor
+        C: fx.Tensor,
+        A_scale: fx.Tensor,
+        B_scale: fx.Tensor,
     ):
         # === Type declarations ===
         MfmaAccumType_t = Vec.make_type(4, fx.Float32)
@@ -87,6 +100,13 @@ def compile_fp8_gemm_4wave(
         A128_gl_offset = (tile_i * BLOCK_M + 128) * K
         B0_gl_offset = (tile_j * BLOCK_N) * K
         B128_gl_offset = (tile_j * BLOCK_N + 128) * K
+
+        A_rsrc = buffer_ops.create_buffer_resource(A)
+        B_rsrc = buffer_ops.create_buffer_resource(B_T)
+        C_rsrc = buffer_ops.create_buffer_resource(C)
+
+        A_scale_rsrc = buffer_ops.create_buffer_resource(A_scale)
+        B_scale_rsrc = buffer_ops.create_buffer_resource(B_scale)
 
         def _c_idx(i, j):
             return i * 4 + j
@@ -177,14 +197,15 @@ def compile_fp8_gemm_4wave(
 
         def _store_rt(c_frag, base_row, base_col):
             for ti in range_constexpr(4):
+                row = base_row + ti * 16 + (lane_id // 16) * 4
+                a_scale_v = Vec(buffer_ops.buffer_load(A_scale_rsrc, fx.Int32(row), vec_width=4, dtype=fx.Float32))
                 for tj in range_constexpr(4):
-                    bf16_vec = Vec(c_frag[_c_idx(ti, tj)]).to(BFloat16)
-                    row = base_row + ti * 16 + (lane_id // 16) * 4
                     col = base_col + tj * 16 + lane_id % 16
-                    buffer_ops.buffer_store(bf16_vec[0], C_rsrc, fx.Int32((row + 0) * N + col))
-                    buffer_ops.buffer_store(bf16_vec[1], C_rsrc, fx.Int32((row + 1) * N + col))
-                    buffer_ops.buffer_store(bf16_vec[2], C_rsrc, fx.Int32((row + 2) * N + col))
-                    buffer_ops.buffer_store(bf16_vec[3], C_rsrc, fx.Int32((row + 3) * N + col))
+                    b_scale = buffer_ops.buffer_load(B_scale_rsrc, fx.Int32(col), vec_width=1, dtype=fx.Float32)
+                    vec_f32 = Vec(c_frag[_c_idx(ti, tj)])
+                    for i in range_constexpr(4):
+                        scaled = (vec_f32[i] * (a_scale_v[i] * b_scale)).to(fx.BFloat16)
+                        buffer_ops.buffer_store(scaled, C_rsrc, fx.Int32((row + i) * N + col))
 
         def _mfma_ABt(a, b, c, m, n):
             c[_c_idx(m, n)] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(MfmaAccumType_t, [a[m], b[n], c[_c_idx(m, n)], 0, 0, 0, 0x7F7F7F7F, 0, 0x7F7F7F7F])
@@ -196,92 +217,90 @@ def compile_fp8_gemm_4wave(
                     c[_c_idx(i, j)] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(MfmaAccumType_t, [a[i], b[j], c[_c_idx(i, j)], 0, 0, 0, 0x7F7F7F7F, 0, 0x7F7F7F7F])
             return c
 
+        def _wait_barrier(count):
+            _llvm.inline_asm(
+                res=None,
+                operands_=[],
+                asm_string=f"s_waitcnt vmcnt({count})\ns_barrier",
+                constraints="",
+                has_side_effects=True
+            )
+
         def _interleaved_cluster(lds_dst, gl_src, k_offset, gl_offsets, wave_idx, lds_src, a, b, c):
-            c = _mfma_ABt_all(a, b, c)
-            _load_lds(gl_src, lds_dst, k_offset, gl_offsets)
-            rt_dst = _load_rt(lds_src, wave_idx)
+            # Compute a 64x64 output tile using 4x4 MFMA instructions
+            # returns the updated accumulator and the next fragment loaded from lds_src
+            rt_dst = []
+
+            rocdl.sched_barrier(0)
+            c = _mfma_ABt(a, b, c, 0, 0)
+            c = _mfma_ABt(a, b, c, 0, 1)
+            rocdl.sched_barrier(0)
+
+            lds_swz = _compute_lds_swizzle(wave_idx)
+            _load_one_lds(gl_src, lds_dst, k_offset, gl_offsets, 0)
+            rt_dst_0 = _load_one_rt(lds_src, lds_swz, 0, 0)
+
+            rocdl.sched_barrier(0)
+            c = _mfma_ABt(a, b, c, 0, 2)
+            rocdl.sched_barrier(0)
+
+            rt_dst_1 = _load_one_rt(lds_src, lds_swz, 0, 1)
+            rt_dst.append(_pack_i32x42_i32x8(rt_dst_0, rt_dst_1))
+
+            rocdl.sched_barrier(0)
+            c = _mfma_ABt(a, b, c, 0, 3)
+            rocdl.sched_barrier(0)
+
+            _load_one_lds(gl_src, lds_dst, k_offset, gl_offsets, 1)
+            rt_dst_0 = _load_one_rt(lds_src, lds_swz, 1, 0)
+
+            rocdl.sched_barrier(0)
+            c = _mfma_ABt(a, b, c, 1, 0)
+            c = _mfma_ABt(a, b, c, 1, 1)
+            rocdl.sched_barrier(0)
+
+            rt_dst_1 = _load_one_rt(lds_src, lds_swz, 1, 1)
+            rt_dst.append(_pack_i32x42_i32x8(rt_dst_0, rt_dst_1))
+
+            rocdl.sched_barrier(0)
+            c = _mfma_ABt(a, b, c, 1, 2)
+            c = _mfma_ABt(a, b, c, 1, 3)
+            rocdl.sched_barrier(0)
+
+            _load_one_lds(gl_src, lds_dst, k_offset, gl_offsets, 2)
+            rt_dst_0 = _load_one_rt(lds_src, lds_swz, 2, 0)
+
+            rocdl.sched_barrier(0)
+            c = _mfma_ABt(a, b, c, 2, 0)
+            c = _mfma_ABt(a, b, c, 2, 1)
+            rocdl.sched_barrier(0)
+
+            rt_dst_1 = _load_one_rt(lds_src, lds_swz, 2, 1)
+            rt_dst.append(_pack_i32x42_i32x8(rt_dst_0, rt_dst_1))
+
+            rocdl.sched_barrier(0)
+            c = _mfma_ABt(a, b, c, 2, 2)
+            c = _mfma_ABt(a, b, c, 2, 3)
+            rocdl.sched_barrier(0)
+
+            _load_one_lds(gl_src, lds_dst, k_offset, gl_offsets, 3)
+            rt_dst_0 = _load_one_rt(lds_src, lds_swz, 3, 0)
+
+            rocdl.sched_barrier(0)
+            c = _mfma_ABt(a, b, c, 3, 0)
+            c = _mfma_ABt(a, b, c, 3, 1)
+            rocdl.sched_barrier(0)
+
+            rt_dst_1 = _load_one_rt(lds_src, lds_swz, 3, 1)
+            rt_dst.append(_pack_i32x42_i32x8(rt_dst_0, rt_dst_1))
+
+            rocdl.sched_barrier(0)
+            c = _mfma_ABt(a, b, c, 3, 2)
+            c = _mfma_ABt(a, b, c, 3, 3)
+            rocdl.sched_barrier(0)
 
             return c, rt_dst
 
-        # def _interleaved_cluster(lds_dst, gl_src, k_offset, gl_offsets, wave_idx, lds_src, a, b, c):
-        #     # Compute a 64x64 output tile using 4x4 MFMA instructions
-        #     # returns the updated accumulator and the next fragment loaded from lds_src
-        #     rt_dst = []
-
-        #     rocdl.sched_barrier(0)
-        #     c = _mfma_ABt(a, b, c, 0, 0)
-        #     c = _mfma_ABt(a, b, c, 0, 1)
-        #     rocdl.sched_barrier(0)
-
-        #     lds_swz = _compute_lds_swizzle(wave_idx)
-        #     _load_one_lds(gl_src, lds_dst, k_offset, gl_offsets, 0)
-        #     rt_dst_0 = _load_one_rt(lds_src, lds_swz, 0, 0)
-
-        #     rocdl.sched_barrier(0)
-        #     c = _mfma_ABt(a, b, c, 0, 2)
-        #     rocdl.sched_barrier(0)
-
-        #     rt_dst_1 = _load_one_rt(lds_src, lds_swz, 0, 1)
-        #     rt_dst.append(_pack_i32x42_i32x8(rt_dst_0, rt_dst_1))
-
-        #     rocdl.sched_barrier(0)
-        #     c = _mfma_ABt(a, b, c, 0, 3)
-        #     rocdl.sched_barrier(0)
-
-        #     _load_one_lds(gl_src, lds_dst, k_offset, gl_offsets, 1)
-        #     rt_dst_0 = _load_one_rt(lds_src, lds_swz, 1, 0)
-
-        #     rocdl.sched_barrier(0)
-        #     c = _mfma_ABt(a, b, c, 1, 0)
-        #     c = _mfma_ABt(a, b, c, 1, 1)
-        #     rocdl.sched_barrier(0)
-
-        #     rt_dst_1 = _load_one_rt(lds_src, lds_swz, 1, 1)
-        #     rt_dst.append(_pack_i32x42_i32x8(rt_dst_0, rt_dst_1))
-
-        #     rocdl.sched_barrier(0)
-        #     c = _mfma_ABt(a, b, c, 1, 2)
-        #     c = _mfma_ABt(a, b, c, 1, 3)
-        #     rocdl.sched_barrier(0)
-
-        #     _load_one_lds(gl_src, lds_dst, k_offset, gl_offsets, 2)
-        #     rt_dst_0 = _load_one_rt(lds_src, lds_swz, 2, 0)
-
-        #     rocdl.sched_barrier(0)
-        #     c = _mfma_ABt(a, b, c, 2, 0)
-        #     c = _mfma_ABt(a, b, c, 2, 1)
-        #     rocdl.sched_barrier(0)
-
-        #     rt_dst_1 = _load_one_rt(lds_src, lds_swz, 2, 1)
-        #     rt_dst.append(_pack_i32x42_i32x8(rt_dst_0, rt_dst_1))
-
-        #     rocdl.sched_barrier(0)
-        #     c = _mfma_ABt(a, b, c, 2, 2)
-        #     c = _mfma_ABt(a, b, c, 2, 3)
-        #     rocdl.sched_barrier(0)
-
-        #     _load_one_lds(gl_src, lds_dst, k_offset, gl_offsets, 3)
-        #     rt_dst_0 = _load_one_rt(lds_src, lds_swz, 3, 0)
-
-        #     rocdl.sched_barrier(0)
-        #     c = _mfma_ABt(a, b, c, 3, 0)
-        #     c = _mfma_ABt(a, b, c, 3, 1)
-        #     rocdl.sched_barrier(0)
-
-        #     rt_dst_1 = _load_one_rt(lds_src, lds_swz, 3, 1)
-        #     rt_dst.append(_pack_i32x42_i32x8(rt_dst_0, rt_dst_1))
-
-        #     rocdl.sched_barrier(0)
-        #     c = _mfma_ABt(a, b, c, 3, 2)
-        #     c = _mfma_ABt(a, b, c, 3, 3)
-        #     rocdl.sched_barrier(0)
-
-        #     return c, rt_dst
-
-
-        A_rsrc = buffer_ops.create_buffer_resource(A)
-        B_rsrc = buffer_ops.create_buffer_resource(B_T)
-        C_rsrc = buffer_ops.create_buffer_resource(C)
 
         # Each wave handles 2x2 64x64 sub-tiles of the output
         c00_frag = [RT_C_i] * 16
@@ -304,23 +323,20 @@ def compile_fp8_gemm_4wave(
         _load_lds(A_rsrc, a_next1, A128_gl_offset + 1 * BLOCK_K, global_offsets)
 
         rocdl.sched_barrier(0)
-        rocdl.s_waitcnt(28)
-        gpu.barrier()
+        _wait_barrier(28)
         rocdl.sched_barrier(0)
 
         a0_frag = _load_rt(a_cur0, wave_i)
 
         rocdl.sched_barrier(0)
-        rocdl.s_waitcnt(24)
-        gpu.barrier()
+        _wait_barrier(24)
         rocdl.sched_barrier(0)
 
         b0_frag = _load_rt(b_cur0, wave_j)
 
         for k in range_constexpr(K_ITERS - 2):
             rocdl.sched_barrier(0)
-            rocdl.s_waitcnt(16)
-            gpu.barrier()
+            _wait_barrier(16)
             rocdl.sched_barrier(0)
 
             c00_frag, b1_frag = _interleaved_cluster(
@@ -334,8 +350,7 @@ def compile_fp8_gemm_4wave(
             )
 
             rocdl.sched_barrier(0)
-            rocdl.s_waitcnt(16)
-            gpu.barrier()
+            _wait_barrier(16)
             rocdl.sched_barrier(0)
 
             c10_frag, a0_frag = _interleaved_cluster(
@@ -356,30 +371,36 @@ def compile_fp8_gemm_4wave(
 
         # step k = k_iters - 2
         rocdl.sched_barrier(0)
-        rocdl.s_waitcnt(16)
-        gpu.barrier()
+        _wait_barrier(16)
         rocdl.sched_barrier(0)
 
         b1_frag = _load_rt(b_cur1, wave_j)
 
+        rocdl.sched_barrier(0)
         c00_frag = _mfma_ABt_all(a0_frag, b0_frag, c00_frag)
+        rocdl.sched_barrier(0)
 
         a1_frag = _load_rt(a_cur1, wave_i)
 
+        rocdl.sched_barrier(0)
         c01_frag = _mfma_ABt_all(a0_frag, b1_frag, c01_frag)
+        rocdl.sched_barrier(0)
 
         rocdl.sched_barrier(0)
-        rocdl.s_waitcnt(8)
-        gpu.barrier()
+        _wait_barrier(8)
         rocdl.sched_barrier(0)
 
         a0_frag = _load_rt(a_next0, wave_i)
 
+        rocdl.sched_barrier(0)
         c10_frag = _mfma_ABt_all(a1_frag, b0_frag, c10_frag)
+        rocdl.sched_barrier(0)
 
         b0_frag = _load_rt(b_next0, wave_j)
 
+        rocdl.sched_barrier(0)
         c11_frag = _mfma_ABt_all(a1_frag, b1_frag, c11_frag)
+        rocdl.sched_barrier(0)
 
         # Swap cur and next
         a_cur0, a_next0 = a_next0, a_cur0
@@ -392,21 +413,27 @@ def compile_fp8_gemm_4wave(
         base_col = tile_j * BLOCK_N + wave_j * 64
 
         rocdl.sched_barrier(0)
-        rocdl.s_waitcnt(0)
-        gpu.barrier()
+        _wait_barrier(0)
         rocdl.sched_barrier(0)
 
         b1_frag = _load_rt(b_cur1, wave_j)
         a1_frag = _load_rt(a_cur1, wave_i)
 
+        rocdl.sched_barrier(0)
         c00_frag = _mfma_ABt_all(a0_frag, b0_frag, c00_frag)
+        rocdl.sched_barrier(0)
 
+        rocdl.sched_barrier(0)
         c01_frag = _mfma_ABt_all(a0_frag, b1_frag, c01_frag)
+        rocdl.sched_barrier(0)
 
-
+        rocdl.sched_barrier(0)
         c10_frag = _mfma_ABt_all(a1_frag, b0_frag, c10_frag)
+        rocdl.sched_barrier(0)
 
+        rocdl.sched_barrier(0)
         c11_frag = _mfma_ABt_all(a1_frag, b1_frag, c11_frag)
+        rocdl.sched_barrier(0)
 
         _store_rt(c00_frag, base_row + 0, base_col + 0)
         _store_rt(c01_frag, base_row + 0, base_col + 128)
@@ -420,6 +447,8 @@ def compile_fp8_gemm_4wave(
         A: fx.Tensor,
         B_T: fx.Tensor,
         C: fx.Tensor,
+        A_scale: fx.Tensor,
+        B_scale: fx.Tensor,
         stream: fx.Stream
     ):
         from flydsl._mlir import ir
@@ -443,27 +472,36 @@ def compile_fp8_gemm_4wave(
             B_lds_next0_alloc.finalize()
             B_lds_next1_alloc.finalize()
         grid_x = (M * N) // (256 * 256)
-        kernel_gemm(A, B_T, C).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
+        kernel_gemm(A, B_T, C, A_scale, B_scale).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
     return launch_gemm
 
 
-def check_numbers(x: torch.Tensor, y: torch.Tensor, rtol: float, atol: float):
-    diff = (x - y).abs()
-    max_diff = diff.max().item()
-    avg_diff = diff.mean().item()
-    if not torch.allclose(x, y, rtol=rtol, atol=atol, equal_nan=True):
-        raise Exception(f"Kernel doesn't match PyTorch (max_diff={max_diff} avg_diff={avg_diff})")
-    print(f'=== SUCCESS ===\n--> Kernel matches PyTorch within numerical precision (max_diff={max_diff} avg_diff={avg_diff})')
-
+def run_torch(a, b, scale_a, scale_b, dtype=torch.float32):
+    if scale_a is not None and scale_b is not None:
+        a_f32 = a.to(torch.float32) * scale_a.view(-1, 1)
+        b_f32 = b.to(torch.float32) * scale_b.view(-1, 1)
+    else:
+        a_f32 = a.to(torch.float32)
+        b_f32 = b.to(torch.float32)
+    c = torch.mm(a_f32, b_f32.T)
+    return c.to(dtype)
 
 def check_gemm(size: int):
     M = N = K = size
-    x = (torch.rand((M, K), dtype=torch.float16, device="cuda") / 10).to(FP8_DTYPE)
-    weight = (torch.rand((N, K), dtype=torch.float16, device="cuda") / 10).to(FP8_DTYPE)
-    out = torch.zeros((M, N), dtype=OUT_DTYPE, device="cuda")
+    device = torch.device("cuda")
+    a_fp32 = torch.rand(M, K, device=device, dtype=torch.float32)
+    b_fp32_t = torch.rand(N, K, device=device, dtype=torch.float32)
+    c_out_raw = torch.zeros((M, N), dtype=OUT_DTYPE, device=device)
+    a_q, scale_a = pertoken_quant(a_fp32, quant_dtype=FP8_DTYPE)
+    b_q, scale_b = pertoken_quant(b_fp32_t, quant_dtype=FP8_DTYPE)
 
-    out_ref = F.linear(x.to(torch.float32), weight.to(torch.float32)).to(OUT_DTYPE)
+    a_q = a_q.contiguous()
+    b_q = b_q.contiguous()
+    scale_a = scale_a.squeeze().contiguous()
+    scale_b = scale_b.squeeze().contiguous()
+
+    out_ref = run_torch(a_q, b_q, scale_a, scale_b)
 
     launch_fn = compile_fp8_gemm_4wave(M=M, N=N, K=K)
     def _as_i8(t):
@@ -471,24 +509,26 @@ def check_gemm(size: int):
 
     def _args(c):
         return (
-            _as_i8(x).contiguous().view(-1),
-            _as_i8(weight).contiguous().view(-1),
+            _as_i8(a_q).contiguous().view(-1),
+            _as_i8(b_q).contiguous().view(-1),
             c.contiguous().view(-1),
+            scale_a.contiguous(),
+            scale_b.contiguous(),
             torch.cuda.current_stream(),
         )
 
-    compiled = flyc.compile(launch_fn, *_args(out))
+    compiled = flyc.compile(launch_fn, *_args(c_out_raw))
 
-    compiled(*_args(out))
+    compiled(*_args(c_out_raw))
     torch.cuda.synchronize()
 
-    check_numbers(out, out_ref, rtol=1e-2, atol=1e-2)
+    assert verify_output(c_out_raw.to(torch.float32), out_ref, rtol=0.1, atol=0.1)
 
     if True:
         best = float("+inf")
         for _ in range(1000):
             s = time.perf_counter()
-            compiled(*_args(out))
+            compiled(*_args(c_out_raw))
             torch.cuda.synchronize()
 
             t = time.perf_counter() - s
@@ -500,4 +540,4 @@ def check_gemm(size: int):
 
 
 if __name__ == "__main__":
-    check_gemm(1024*8)
+    check_gemm(1024*12)
