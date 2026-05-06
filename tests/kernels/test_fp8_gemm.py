@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import webbrowser
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
@@ -450,14 +451,29 @@ def main():
     bench_providers = run_benchmarks(baseline)
     providers.update(bench_providers)
 
-    out_path = args.output or os.path.join(os.path.dirname(__file__), "fp8_gemm_perf.html")
     html_content = generate_html(providers)
-    with open(out_path, "w") as f:
-        f.write(html_content)
+
+    use_tmp = args.serve and not args.output
+    if use_tmp:
+        fd, out_path = tempfile.mkstemp(suffix=".html", prefix="fp8_gemm_perf_")
+        os.write(fd, html_content.encode())
+        os.close(fd)
+    elif not args.output:
+        # If no output file is specified we just dump to the terminal and exit
+        sys.exit(0)
+    else:
+        out_path = args.output or os.path.join(os.path.dirname(__file__), "fp8_gemm_perf.html")
+        with open(out_path, "w") as f:
+            f.write(html_content)
+
     print(f"\nReport written to {out_path}")
 
     if args.serve:
-        serve_html(out_path, args.port)
+        try:
+            serve_html(out_path, args.port)
+        finally:
+            if use_tmp:
+                os.unlink(out_path)
 
 
 if __name__ == "__main__":
