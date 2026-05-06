@@ -423,7 +423,7 @@ BENCH_DEFAULT_TOKEN_SWEEP = [1, 4, 8, 32, 64, 128, 256]
 _BENCH_SCALE_GROUP = 32
 
 
-def bench_kernel_us(run_fn, warmup=10, iters=50, flush_l2=True, prep_fn=None):
+def bench_kernel_us(run_fn, warmup=10, iters=50, flush_l2=True, prep_fn=None, report_average=False):
     """Per-iteration CUDA events timer with optional L2 flush and median latency."""
     import torch
 
@@ -468,8 +468,9 @@ def bench_kernel_us(run_fn, warmup=10, iters=50, flush_l2=True, prep_fn=None):
             latencies = filtered
 
     del flush_buf
+    if report_average:
+        return sum(latencies) / len(latencies)
     return latencies[len(latencies) // 2]
-
 
 def bench_best_tile(target, dim, align):
     """Largest value <= target that divides dim and is a multiple of align."""

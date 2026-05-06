@@ -11,21 +11,21 @@ from flydsl.expr import buffer_ops, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-_PYFLYDSL_SRC = os.path.join(_REPO_ROOT, "flydsl", "src")
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
-if _PYFLYDSL_SRC not in sys.path:
-    sys.path.insert(0, _PYFLYDSL_SRC)
+# _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+# _PYFLYDSL_SRC = os.path.join(_REPO_ROOT, "flydsl", "src")
+# if _REPO_ROOT not in sys.path:
+#     sys.path.insert(0, _REPO_ROOT)
+# if _PYFLYDSL_SRC not in sys.path:
+#     sys.path.insert(0, _PYFLYDSL_SRC)
 
-from tests.test_common import verify_output
-from tests.utils import pertoken_quant
+# from tests.test_common import verify_output
+# from tests.utils import pertoken_quant
 
-FP8_DTYPE = torch.float8_e4m3fn
-OUT_DTYPE = torch.bfloat16
+# FP8_DTYPE = torch.float8_e4m3fn
+# OUT_DTYPE = torch.bfloat16
 
 
-def compile_fp8_gemm_4wave(
+def compile_fp8_gemm_256x256x128(
         *,
         M: int,
         N: int,
@@ -477,67 +477,161 @@ def compile_fp8_gemm_4wave(
     return launch_gemm
 
 
-def run_torch(a, b, scale_a, scale_b, dtype=torch.float32):
-    if scale_a is not None and scale_b is not None:
-        a_f32 = a.to(torch.float32) * scale_a.view(-1, 1)
-        b_f32 = b.to(torch.float32) * scale_b.view(-1, 1)
-    else:
-        a_f32 = a.to(torch.float32)
-        b_f32 = b.to(torch.float32)
-    c = torch.mm(a_f32, b_f32.T)
-    return c.to(dtype)
+def compile_fp8_gemm_128x128x128(
+        *,
+        M: int,
+        N: int,
+        K: int
+):
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_K = 128
 
-def check_gemm(size: int):
-    M = N = K = size
-    device = torch.device("cuda")
-    a_fp32 = torch.rand(M, K, device=device, dtype=torch.float32)
-    b_fp32_t = torch.rand(N, K, device=device, dtype=torch.float32)
-    c_out_raw = torch.zeros((M, N), dtype=OUT_DTYPE, device=device)
-    a_q, scale_a = pertoken_quant(a_fp32, quant_dtype=FP8_DTYPE)
-    b_q, scale_b = pertoken_quant(b_fp32_t, quant_dtype=FP8_DTYPE)
+    N_BLOCKS = N // BLOCK_N
+    K_ITERS = K // BLOCK_K
 
-    a_q = a_q.contiguous()
-    b_q = b_q.contiguous()
-    scale_a = scale_a.squeeze().contiguous()
-    scale_b = scale_b.squeeze().contiguous()
-
-    out_ref = run_torch(a_q, b_q, scale_a, scale_b)
-
-    launch_fn = compile_fp8_gemm_4wave(M=M, N=N, K=K)
-    def _as_i8(t):
-        return t.view(torch.int8) if "float8" in str(t.dtype) else t
-
-    def _args(c):
-        return (
-            _as_i8(a_q).contiguous().view(-1),
-            _as_i8(b_q).contiguous().view(-1),
-            c.contiguous().view(-1),
-            scale_a.contiguous(),
-            scale_b.contiguous(),
-            torch.cuda.current_stream(),
-        )
-
-    compiled = flyc.compile(launch_fn, *_args(c_out_raw))
-
-    compiled(*_args(c_out_raw))
-    torch.cuda.synchronize()
-
-    assert verify_output(c_out_raw.to(torch.float32), out_ref, rtol=0.1, atol=0.1)
-
-    if True:
-        best = float("+inf")
-        for _ in range(1000):
-            s = time.perf_counter()
-            compiled(*_args(c_out_raw))
-            torch.cuda.synchronize()
-
-            t = time.perf_counter() - s
-            best = best if t > best else t
-
-        tflops = (2 * M * N * K) * 1e-12 / best
-
-        print(f'FP8 GEMM SIZE={size} TFLOPS={round(tflops, 1)}')
+    assert N % BLOCK_N == 0
+    assert M % BLOCK_M == 0
+    assert K % BLOCK_K == 0
 
 
-if __name__ == "__main__":
-    check_gemm(1024*12)
+    @flyc.kernel
+    def kernel_gemm(
+        A: fx.Tensor,
+        B_T: fx.Tensor,
+        C: fx.Tensor,
+        A_scale: fx.Tensor,
+        B_scale: fx.Tensor,
+    ):
+        pass
+
+    @flyc.jit
+    def launch_gemm(
+        A: fx.Tensor,
+        B_T: fx.Tensor,
+        C: fx.Tensor,
+        A_scale: fx.Tensor,
+        B_scale: fx.Tensor,
+        stream: fx.Stream
+    ):
+        grid_x = (M * N) // (128 * 128)
+        kernel_gemm(A, B_T, C, A_scale, B_scale).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
+
+    return launch_gemm
+
+
+
+def compile_fp8_gemm_64x64x128(
+        *,
+        M: int,
+        N: int,
+        K: int
+):
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 128
+
+    N_BLOCKS = N // BLOCK_N
+    K_ITERS = K // BLOCK_K
+
+    assert N % BLOCK_N == 0
+    assert M % BLOCK_M == 0
+    assert K % BLOCK_K == 0
+
+
+    @flyc.kernel
+    def kernel_gemm(
+        A: fx.Tensor,
+        B_T: fx.Tensor,
+        C: fx.Tensor,
+        A_scale: fx.Tensor,
+        B_scale: fx.Tensor,
+    ):
+        pass
+
+    @flyc.jit
+    def launch_gemm(
+        A: fx.Tensor,
+        B_T: fx.Tensor,
+        C: fx.Tensor,
+        A_scale: fx.Tensor,
+        B_scale: fx.Tensor,
+        stream: fx.Stream
+    ):
+        grid_x = (M * N) // (64 * 64)
+        kernel_gemm(A, B_T, C, A_scale, B_scale).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
+
+    return launch_gemm
+
+
+
+# def run_torch(a, b, scale_a, scale_b, dtype=torch.float32):
+#     if scale_a is not None and scale_b is not None:
+#         a_f32 = a.to(torch.float32) * scale_a.view(-1, 1)
+#         b_f32 = b.to(torch.float32) * scale_b.view(-1, 1)
+#     else:
+#         a_f32 = a.to(torch.float32)
+#         b_f32 = b.to(torch.float32)
+#     c = torch.mm(a_f32, b_f32.T)
+#     return c.to(dtype)
+
+# def check_gemm(size: int):
+#     M = N = K = size
+#     device = torch.device("cuda")
+#     a_fp32 = torch.rand(M, K, device=device, dtype=torch.float32)
+#     b_fp32_t = torch.rand(N, K, device=device, dtype=torch.float32)
+#     c_out_raw = torch.zeros((M, N), dtype=OUT_DTYPE, device=device)
+#     a_q, scale_a = pertoken_quant(a_fp32, quant_dtype=FP8_DTYPE)
+#     b_q, scale_b = pertoken_quant(b_fp32_t, quant_dtype=FP8_DTYPE)
+
+#     a_q = a_q.contiguous()
+#     b_q = b_q.contiguous()
+#     scale_a = scale_a.squeeze().contiguous()
+#     scale_b = scale_b.squeeze().contiguous()
+
+#     out_ref = run_torch(a_q, b_q, scale_a, scale_b)
+
+#     launch_fn = compile_fp8_gemm_4wave(M=M, N=N, K=K)
+#     def _as_i8(t):
+#         return t.view(torch.int8) if "float8" in str(t.dtype) else t
+
+#     def _args(c):
+#         return (
+#             _as_i8(a_q).contiguous().view(-1),
+#             _as_i8(b_q).contiguous().view(-1),
+#             c.contiguous().view(-1),
+#             scale_a.contiguous(),
+#             scale_b.contiguous(),
+#             torch.cuda.current_stream(),
+#         )
+
+#     compiled = flyc.compile(launch_fn, *_args(c_out_raw))
+
+#     compiled(*_args(c_out_raw))
+#     torch.cuda.synchronize()
+
+#     assert verify_output(c_out_raw.to(torch.float32), out_ref, rtol=0.1, atol=0.1)
+
+#     if True:
+#         best = float("+inf")
+#         for _ in range(1000):
+#             s = time.perf_counter()
+#             compiled(*_args(c_out_raw))
+#             torch.cuda.synchronize()
+
+#             t = time.perf_counter() - s
+#             best = best if t > best else t
+
+#         tflops = (2 * M * N * K) * 1e-12 / best
+
+#         print(f'FP8 GEMM SIZE={size} TFLOPS={round(tflops, 1)}')
+
+
+# if __name__ == "__main__":
+#     # check_gemm(1024*4)
+#     # check_gemm(1024*6)
+#     # check_gemm(1024*8)
+#     # check_gemm(1024*10)
+#     check_gemm(1024*12)
+#     # check_gemm(1024*14)
+#     # check_gemm(1024*16)
