@@ -4,6 +4,22 @@ set -e
 # Install system deps
 apt-get update && apt-get install -y cmake bear patchelf clang-format clangd
 
+# Install rocprof-trace-decoder
+echo "Installing rocprof-trace-decoder..."
+mkdir -p ~/rocprofiler-setup
+cd ~/rocprofiler-setup
+
+wget https://github.com/ROCm/rocprof-trace-decoder/releases/download/0.1.1/rocprof-trace-decoder-ubuntu-22.04-0.1.1-Linux.deb
+dpkg -i rocprof-trace-decoder-ubuntu-22.04-0.1.1-Linux.deb
+
+git clone https://github.com/ROCm/aqlprofile.git
+cd aqlprofile
+./build.sh
+cd build
+make install
+cd ../../..
+rm -rf rocprofiler-setup
+
 # Install claude code
 curl -fsSL https://claude.ai/install.sh | bash -s stable
 
