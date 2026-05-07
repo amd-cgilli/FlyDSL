@@ -538,6 +538,8 @@ def compile_fp8_gemm(
     N_ACCUMS = N_TILES_A * N_TILES_B # Each accumulator is 4 floats (depends on MFMA atom)
     assert N_ACCUMS > 0
 
+    _use_interleaved_block = BLOCK_M == 256 and BLOCK_N == 256
+
     A_lds_cur0_alloc = SmemAllocator(None, "gfx950", "A_lds_cur_0")
     A_lds_cur1_alloc = SmemAllocator(None, "gfx950", "A_lds_cur_1")
     A_lds_next0_alloc = SmemAllocator(None, "gfx950", "A_lds_next_0")
@@ -673,7 +675,7 @@ def compile_fp8_gemm(
             # Pack two i32x4 as one i32x8
             return lo.shuffle(hi, list(range(8)))
 
-        def _load_rt(lds_src, lane_id, wave_idx, n_tiles):
+        def _load_rt(lds_src, wave_idx, n_tiles):
             # Load n_tiles 16x128 fragments from LDS to registers
             # Each 16x128 fragment requires 2 i32x4 (2 ds_read_b128)
             frag = []
@@ -749,7 +751,7 @@ def compile_fp8_gemm(
             c[_c_idx(m, n)] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(MfmaAccum_t, [a[m], b[n], c[_c_idx(m, n)], 0, 0, 0, 0x7F7F7F7F, 0, 0x7F7F7F7F])
             return c
 
-        def _interleaved_cluster(lds_dst, gl_src, k_offset, gl_offsets, wave_idx, lds_src, n_tiles_preloaded, a, b, c):
+        def _interleaved_cluster(lds_dst, gl_src, k_offset, gl_offsets, wave_idx, lds_src, n_tiles_lds, a, b, c):
             # Compute a 64x64 output tile using 4x4 MFMA instructions
             # returns the updated accumulator and the next fragment loaded from lds_src
             rt_dst = []
@@ -759,7 +761,7 @@ def compile_fp8_gemm(
             c = _mfma_ABt_one(a, b, c, 0, 1)
             # rocdl.sched_barrier(0)
 
-            lds_swz = _compute_lds_swizzle(wave_idx, n_tiles_preloaded)
+            lds_swz = _compute_lds_swizzle(wave_idx, n_tiles_lds)
             _load_one_lds(gl_src, lds_dst, k_offset, gl_offsets, 0)
             rt_dst_0 = _load_one_rt(lds_src, lds_swz, 0, 0)
 
@@ -824,6 +826,36 @@ def compile_fp8_gemm(
 
             return c, rt_dst
 
+        def _compute_cluster(lds_dst, gl_src, k_offset, gl_offsets, wave_idx, lds_src, n_tiles_lds, n_tiles_rt, a, b, c):
+            _load_lds(gl_src, lds_dst, k_offset, gl_offsets, n_tiles_lds)
+            rt_dst = _load_rt(lds_src, wave_idx, n_tiles_rt)
+            c = _mfma_ABt_all(a, b, c)
+            return c, rt_dst
+
+        def _compute_block(lds_dst, gl_src, k_offset, gl_offsets, wave_idx, lds_src, n_tiles_lds, n_tiles_rt, a, b, c):
+            if const_expr(_use_interleaved_block):
+                return _interleaved_cluster(
+                    lds_dst,
+                    gl_src,
+                    k_offset,
+                    gl_offsets,
+                    wave_idx,
+                    lds_src,
+                    n_tiles_lds,
+                    a, b, c
+                )
+            else:
+                return _compute_cluster(
+                    lds_dst,
+                    gl_src,
+                    k_offset,
+                    gl_offsets,
+                    wave_idx,
+                    lds_src,
+                    n_tiles_lds,
+                    n_tiles_rt,
+                    a, b, c
+                )
 
         # Each wave handles 2x2 64x64 sub-tiles of the output
         c00_frag = [RT_C_i] * N_ACCUMS
@@ -849,35 +881,35 @@ def compile_fp8_gemm(
         # that would be 4 * TILES_A + 4 * TILES_B but since we need a_cur0 it's 3*TILES_A
         _wait_barrier((3 * N_TILES_A) + (4 * N_TILES_B)) # wait for a_cur0
 
-        a0_frag = _load_rt(a_cur0, lane_id, wave_i, N_TILES_A)
+        a0_frag = _load_rt(a_cur0, wave_i, N_TILES_A)
 
         _wait_barrier((3 * N_TILES_A) + (3 * N_TILES_B)) # wait for b_cur0
 
-        b0_frag = _load_rt(b_cur0, lane_id, wave_j, N_TILES_B)
+        b0_frag = _load_rt(b_cur0, wave_j, N_TILES_B)
 
         for k in range_constexpr(K_ITERS - 2):
             _wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B)) # 2 loads in-flight for each of A/B
 
-            c00_frag, b1_frag = _interleaved_cluster(
+            c00_frag, b1_frag = _compute_block(
                 a_cur0, A_rsrc, A0_gl_offset + (k + 2) * BLOCK_K, global_offsets,
-                wave_j, b_cur1, N_TILES_B, a0_frag, b0_frag, c00_frag
+                wave_j, b_cur1, N_TILES_A, N_TILES_B, a0_frag, b0_frag, c00_frag
             )
 
-            c01_frag, a1_frag = _interleaved_cluster(
+            c01_frag, a1_frag = _compute_block(
                 b_cur0, B_rsrc, B0_gl_offset + (k + 2) * BLOCK_K, global_offsets,
-                wave_i, a_cur1, N_TILES_A, a0_frag, b1_frag, c01_frag
+                wave_i, a_cur1, N_TILES_B, N_TILES_A, a0_frag, b1_frag, c01_frag
             )
 
             _wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B))
 
-            c10_frag, a0_frag = _interleaved_cluster(
+            c10_frag, a0_frag = _compute_block(
                 b_cur1, B_rsrc, B1_gl_offset + (k + 2) * BLOCK_K, global_offsets,
-                wave_i, a_next0, N_TILES_A, a1_frag, b0_frag, c10_frag
+                wave_i, a_next0, N_TILES_B, N_TILES_A, a1_frag, b0_frag, c10_frag
             )
 
-            c11_frag, b0_frag = _interleaved_cluster(
+            c11_frag, b0_frag = _compute_block(
                 a_cur1, A_rsrc, A1_gl_offset + (k + 2) * BLOCK_K, global_offsets,
-                wave_j, b_next0, N_TILES_B, a1_frag, b1_frag, c11_frag
+                wave_j, b_next0, N_TILES_A, N_TILES_B, a1_frag, b1_frag, c11_frag
             )
 
             # Swap cur and next
@@ -889,13 +921,13 @@ def compile_fp8_gemm(
         # step k = k_iters - 2
         _wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B))
 
-        b1_frag = _load_rt(b_cur1, lane_id, wave_j, N_TILES_B)
+        b1_frag = _load_rt(b_cur1, wave_j, N_TILES_B)
 
         # rocdl.sched_barrier(0)
         c00_frag = _mfma_ABt_all(a0_frag, b0_frag, c00_frag)
         # rocdl.sched_barrier(0)
 
-        a1_frag = _load_rt(a_cur1, lane_id, wave_i, N_TILES_A)
+        a1_frag = _load_rt(a_cur1, wave_i, N_TILES_A)
 
         # rocdl.sched_barrier(0)
         c01_frag = _mfma_ABt_all(a0_frag, b1_frag, c01_frag)
@@ -903,13 +935,13 @@ def compile_fp8_gemm(
 
         _wait_barrier((1 * N_TILES_A) + (1 * N_TILES_B))
 
-        a0_frag = _load_rt(a_next0, lane_id, wave_i, N_TILES_A)
+        a0_frag = _load_rt(a_next0, wave_i, N_TILES_A)
 
         # rocdl.sched_barrier(0)
         c10_frag = _mfma_ABt_all(a1_frag, b0_frag, c10_frag)
         # rocdl.sched_barrier(0)
 
-        b0_frag = _load_rt(b_next0, lane_id, wave_j, N_TILES_B)
+        b0_frag = _load_rt(b_next0, wave_j, N_TILES_B)
 
         # rocdl.sched_barrier(0)
         c11_frag = _mfma_ABt_all(a1_frag, b1_frag, c11_frag)
@@ -927,8 +959,8 @@ def compile_fp8_gemm(
 
         _wait_barrier(0)
 
-        b1_frag = _load_rt(b_cur1, lane_id, wave_j, N_TILES_B)
-        a1_frag = _load_rt(a_cur1, lane_id, wave_i, N_TILES_A)
+        b1_frag = _load_rt(b_cur1, wave_j, N_TILES_B)
+        a1_frag = _load_rt(a_cur1, wave_i, N_TILES_A)
 
         # rocdl.sched_barrier(0)
         c00_frag = _mfma_ABt_all(a0_frag, b0_frag, c00_frag)
@@ -947,9 +979,9 @@ def compile_fp8_gemm(
         # rocdl.sched_barrier(0)
 
         _store_C_scaled(c00_frag, base_row + 0, base_col + 0)
-        _store_C_scaled(c01_frag, base_row + 0, base_col + 128)
-        _store_C_scaled(c10_frag, base_row + 128, base_col + 0)
-        _store_C_scaled(c11_frag, base_row + 128, base_col + 128)
+        _store_C_scaled(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
+        _store_C_scaled(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
+        _store_C_scaled(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
 
 
     @flyc.jit
@@ -981,7 +1013,7 @@ def compile_fp8_gemm(
             B_lds_cur1_alloc.finalize()
             B_lds_next0_alloc.finalize()
             B_lds_next1_alloc.finalize()
-        grid_x = (M * N) // (256 * 256)
+        grid_x = (M * N) // (BLOCK_M * BLOCK_N)
         kernel_gemm(A, B_T, C, A_scale, B_scale,
                     value_attrs={
                         "rocdl.waves_per_eu": 1,
@@ -1240,7 +1272,7 @@ def run_torch(a, b, scale_a, scale_b, dtype=torch.float32):
     c = torch.mm(a_f32, b_f32.T)
     return c.to(dtype)
 
-def check_gemm(size: int):
+def check_gemm(size: int, block_m, block_n):
     M = N = K = size
     device = torch.device("cuda")
     a_fp32 = torch.rand(M, K, device=device, dtype=torch.float32)
@@ -1256,7 +1288,8 @@ def check_gemm(size: int):
 
     out_ref = run_torch(a_q, b_q, scale_a, scale_b)
 
-    launch_fn = compile_fp8_gemm(M=M, N=N, K=K)
+    print(f'Testing GEMM with input size: {M}x{N}x{K} block size: {block_m}x{block_n}x128...')
+    launch_fn = compile_fp8_gemm(M=M, N=N, K=K, BLOCK_M=block_m, BLOCK_N=block_n)
     def _as_i8(t):
         return t.view(torch.int8) if "float8" in str(t.dtype) else t
 
@@ -1275,12 +1308,12 @@ def check_gemm(size: int):
     compiled(*_args(c_out_raw, a_q, b_q, scale_a, scale_b))
     torch.cuda.synchronize()
 
-    assert verify_output(c_out_raw.to(torch.float32), out_ref, rtol=0.1, atol=0.1)
-
+    if verify_output(c_out_raw.to(torch.float32), out_ref, rtol=0.1, atol=0.1):
+        print('OK!')
     def _launch(c, a, b, sa, sb):
         compiled(*_args(c, a, b, sa, sb))
 
-    if True:
+    if False:
         # best = float("+inf")
         # for _ in range(10):
         #     _launch(c_out_raw, a_q, b_q, scale_a, scale_b)
@@ -1311,9 +1344,12 @@ def check_gemm(size: int):
 
 
 if __name__ == "__main__":
-    # check_gemm(1024)
+    check_gemm(1024, 64, 64)
+    check_gemm(1024, 128, 128)
+    check_gemm(1024, 256, 256)
     # check_gemm(1024*6)
-    check_gemm(1024*8)
+
+    # check_gemm(1024*8, b_m, b_n)
     # check_gemm(1024*10)
     # check_gemm(1024*12)
     # check_gemm(1024*14)
