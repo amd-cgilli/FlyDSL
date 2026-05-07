@@ -514,10 +514,16 @@ def compile_fp8_gemm(
         K: int,
         BLOCK_M: int = 256,
         BLOCK_N: int = 256,
-        BLOCK_K: int = 128
 ):
+    # fixed for MFMA 16x16x128
+    BLOCK_K = 128
+
     LDS_BLOCK_M = BLOCK_M // 2
     LDS_BLOCK_N = BLOCK_N // 2
+
+    # The base mfma atom is 16x16, we use 4 waves in a 2x2 config so the block size must be at least 64 to keep this config
+    assert BLOCK_M >= 64
+    assert BLOCK_N >= 64
 
     assert N % BLOCK_N == 0
     assert M % BLOCK_M == 0
@@ -526,11 +532,8 @@ def compile_fp8_gemm(
     N_BLOCKS = N // BLOCK_N
     K_ITERS = K // BLOCK_K
 
-    # The base mfma atom is 16x16, we use 4 waves in a 2x2 config
     N_TILES_A = BLOCK_M // 4 // 16 # this is actually the number of 16-row tiles in a BLOCK_M x BLOCK_N tile
     N_TILES_B = BLOCK_N // 4 // 16
-
-    assert N_TILES_A == N_TILES_B
 
     N_ACCUMS = N_TILES_A * N_TILES_B # Each accumulator is 4 floats (depends on MFMA atom)
     assert N_ACCUMS > 0
@@ -608,8 +611,7 @@ def compile_fp8_gemm(
 
         def _compute_global_swizzle():
             offsets = []
-            # TODO: what is this?
-            for round in range_constexpr(N_TILES_A):
+            for round in range_constexpr(max(N_TILES_A, N_TILES_B)):
                 row = lane_id // 8 + wave_id * 8 + round * 32
                 col = (lane_id % 8) * 16
                 a, b = _swizzle_128(row, col)
@@ -631,6 +633,8 @@ def compile_fp8_gemm(
             return lds_swz
 
         def _load_lds(gl_src, lds_dst, k_offset, gl_offsets, n_tiles):
+            assert len(gl_offsets) >= n_tiles
+
             from flydsl._mlir.dialects import memref as memref_dialect
             lds_base_i = memref_dialect.extract_aligned_pointer_as_index(lds_dst)
             for step in range_constexpr(n_tiles):
@@ -648,7 +652,7 @@ def compile_fp8_gemm(
                 )
 
         def _load_one_lds(gl_src, lds_dst, k_offset, gl_offsets, tile_idx):
-            assert tile_idx < 4
+            assert len(gl_offsets) > tile_idx
 
             from flydsl._mlir.dialects import memref as memref_dialect
             lds_base_i = memref_dialect.extract_aligned_pointer_as_index(lds_dst)
@@ -726,8 +730,7 @@ def compile_fp8_gemm(
             )
             rocdl.sched_barrier(0)
 
-        def _c_idx(i, j, ):
-            # n_cols: stride of a C register tile, equal to the number of 16x128 tiles in B
+        def _c_idx(i, j):
             return i * N_TILES_B + j
 
         def _mfma_ABt_all(a, b, c):
@@ -828,7 +831,6 @@ def compile_fp8_gemm(
         c10_frag = [RT_C_i] * N_ACCUMS
         c11_frag = [RT_C_i] * N_ACCUMS
 
-        # TODO: what happens if N_TILES_A/B are different? Probably should use the max between the two?
         global_offsets = _compute_global_swizzle()
 
         # Prologue: pre-load A/B cur
@@ -843,16 +845,18 @@ def compile_fp8_gemm(
         _load_lds(B_rsrc, b_next1, B1_gl_offset + 1 * BLOCK_K, global_offsets, N_TILES_B)
         _load_lds(A_rsrc, a_next1, A1_gl_offset + 1 * BLOCK_K, global_offsets, N_TILES_A)
 
-        _wait_barrier(28)
+        # So far we issued 4 loads for A and 4 loads for B, each load requires N_TILES_A/B memory ops
+        # that would be 4 * TILES_A + 4 * TILES_B but since we need a_cur0 it's 3*TILES_A
+        _wait_barrier((3 * N_TILES_A) + (4 * N_TILES_B)) # wait for a_cur0
 
         a0_frag = _load_rt(a_cur0, lane_id, wave_i, N_TILES_A)
 
-        _wait_barrier(24)
+        _wait_barrier((3 * N_TILES_A) + (3 * N_TILES_B)) # wait for b_cur0
 
         b0_frag = _load_rt(b_cur0, lane_id, wave_j, N_TILES_B)
 
         for k in range_constexpr(K_ITERS - 2):
-            _wait_barrier(16)
+            _wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B)) # 2 loads in-flight for each of A/B
 
             c00_frag, b1_frag = _interleaved_cluster(
                 a_cur0, A_rsrc, A0_gl_offset + (k + 2) * BLOCK_K, global_offsets,
@@ -864,7 +868,7 @@ def compile_fp8_gemm(
                 wave_i, a_cur1, N_TILES_A, a0_frag, b1_frag, c01_frag
             )
 
-            _wait_barrier(16)
+            _wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B))
 
             c10_frag, a0_frag = _interleaved_cluster(
                 b_cur1, B_rsrc, B1_gl_offset + (k + 2) * BLOCK_K, global_offsets,
@@ -883,7 +887,7 @@ def compile_fp8_gemm(
             b_cur1, b_next1 = b_next1, b_cur1
 
         # step k = k_iters - 2
-        _wait_barrier(16)
+        _wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B))
 
         b1_frag = _load_rt(b_cur1, lane_id, wave_j, N_TILES_B)
 
@@ -897,7 +901,7 @@ def compile_fp8_gemm(
         c01_frag = _mfma_ABt_all(a0_frag, b1_frag, c01_frag)
         # rocdl.sched_barrier(0)
 
-        _wait_barrier(8)
+        _wait_barrier((1 * N_TILES_A) + (1 * N_TILES_B))
 
         a0_frag = _load_rt(a_next0, lane_id, wave_i, N_TILES_A)
 
@@ -946,7 +950,6 @@ def compile_fp8_gemm(
         _store_C_scaled(c01_frag, base_row + 0, base_col + 128)
         _store_C_scaled(c10_frag, base_row + 128, base_col + 0)
         _store_C_scaled(c11_frag, base_row + 128, base_col + 128)
-
 
 
     @flyc.jit
