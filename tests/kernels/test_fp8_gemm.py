@@ -25,7 +25,7 @@ if _REPO_ROOT not in sys.path:
 if _PYFLYDSL_SRC not in sys.path:
     sys.path.insert(0, _PYFLYDSL_SRC)
 
-from tests.kernels.bench_fp8_gemm import bench_gemm, get_torch_scaled_mm_perf
+from tests.kernels.bench_fp8_gemm import bench_gemm, bench_torch_scaled_mm
 
 CSV_URL = (
     "https://raw.githubusercontent.com/ROCm/aiter/main/"
@@ -132,7 +132,7 @@ def run_benchmarks(baseline: list[dict]) -> dict[str, list[dict]]:
             print("  FlyDSL 4-Wave: SKIP")
 
         try:
-            torch_tf = get_torch_scaled_mm_perf(m, n, k)
+            torch_tf = bench_torch_scaled_mm(m, n, k)
             _print_speedup("torch.scaled_mm", torch_tf, base_tf)
             torch_results.append({
                 "M": m, "N": n, "K": k,
