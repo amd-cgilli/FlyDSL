@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import buffer_ops, range_constexpr, rocdl
+from flydsl.expr import arith, buffer_ops, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
@@ -24,6 +24,36 @@ from tests.utils import pertoken_quant
 FP8_DTYPE = torch.float8_e4m3fn
 OUT_DTYPE = torch.bfloat16
 
+def _divmod(a, b):
+    return (a // b, a % b)
+
+def _min(a, b):
+    return arith.select(a < b, a, b)
+
+def _xcd_swizzle(num_pid_m, num_pid_n):
+    NUM_XCDS = 8
+    WGM = 4
+    NUM_CUS = 32 * NUM_XCDS
+    SWIZZLE_THRESHOLD = 4 * NUM_CUS
+
+    wgid = fx.block_idx.x
+
+    num_wg = num_pid_m * num_pid_n
+
+    if num_wg <= SWIZZLE_THRESHOLD or num_wg % NUM_XCDS != 0:
+        # naive mapping
+        return _divmod(wgid, num_pid_n)
+
+    intra_xcd, xcd = _divmod(wgid, NUM_XCDS)
+    wgid = xcd * (num_wg // NUM_XCDS) + intra_xcd
+    num_wgid_in_group = WGM * num_pid_n
+    group_id, intra_group = _divmod(wgid, num_wgid_in_group)
+    first_pid_m = group_id * WGM
+    group_size_m = _min(num_pid_m - first_pid_m, WGM)
+    pid_n, intra_group_m = _divmod(intra_group, group_size_m)
+    pid_m = first_pid_m + intra_group_m
+    return (pid_m, pid_n)
+
 def compile_fp8_gemm(
         *,
         M: int,
@@ -31,6 +61,7 @@ def compile_fp8_gemm(
         K: int,
         BLOCK_M: int = 256,
         BLOCK_N: int = 256,
+        use_xcd_remap: bool = True
 ):
     # fixed for MFMA 16x16x128
     BLOCK_K = 128
@@ -106,8 +137,11 @@ def compile_fp8_gemm(
         lane_id = fx.thread_idx.x % 64
         wave_id = fx.thread_idx.x // 64
 
-        tile_i = fx.block_idx.x // N_BLOCKS
-        tile_j = fx.block_idx.x % N_BLOCKS
+        if const_expr(use_xcd_remap):
+            tile_i, tile_j = _xcd_swizzle(M // BLOCK_M, N // BLOCK_N)
+        else:
+            tile_i, tile_j = _divmod(fx.block_idx.x, N_BLOCKS)
+
         wave_i = wave_id // 2
         wave_j = wave_id % 2
         A0_gl_offset = (tile_i * BLOCK_M) * K
@@ -239,7 +273,6 @@ def compile_fp8_gemm(
                         buffer_ops.buffer_store(scaled, C_rsrc, fx.Int32((row + i) * N + col))
 
         def _wait_barrier(count):
-            rocdl.sched_barrier(0)
             _llvm.inline_asm(
                 res=None,
                 operands_=[],
@@ -247,7 +280,6 @@ def compile_fp8_gemm(
                 constraints="",
                 has_side_effects=True
             )
-            rocdl.sched_barrier(0)
 
         def _c_idx(i, j):
             return i * N_TILES_B + j
