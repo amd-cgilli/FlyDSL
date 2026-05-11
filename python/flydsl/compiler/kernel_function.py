@@ -12,7 +12,7 @@ from .._mlir.dialects import arith, gpu
 from ..expr.typing import Constexpr
 from .ast_rewriter import ASTRewriter
 from .mlir_utils import convert_to_mlir_attr
-from .protocol import fly_construct, fly_types, fly_values
+from .protocol import construct_from_ir_values, extract_to_ir_values, get_ir_types
 
 # =============================================================================
 # GPU Operation Helpers
@@ -23,6 +23,7 @@ def create_gpu_module(
     sym_name: str,
     targets: Optional[List[str]] = None,
     *,
+    use_explicit_module: bool = False,
     loc=None,
     ip=None,
 ) -> gpu.GPUModuleOp:
@@ -33,8 +34,13 @@ def create_gpu_module(
                 target_attrs.append(ir.Attribute.parse(t))
             else:
                 target_attrs.append(t)
+    offloading = ir.Attribute.parse("#fly.explicit_module") if use_explicit_module else None
     module_op = gpu.GPUModuleOp(
-        sym_name, targets=ir.ArrayAttr.get(target_attrs) if target_attrs else None, loc=loc, ip=ip
+        sym_name,
+        targets=ir.ArrayAttr.get(target_attrs) if target_attrs else None,
+        offloadingHandler=offloading,
+        loc=loc,
+        ip=ip,
     )
     module_op.regions[0].blocks.append()
     return module_op
@@ -174,8 +180,8 @@ DimType = Union[int, ir.Value, Tuple[DimValueType, ...], List[DimValueType]]
 def _unwrap_to_raw(val):
     if isinstance(val, ir.Value):
         return val
-    if hasattr(val, "__fly_values__"):
-        values = val.__fly_values__()
+    if hasattr(val, "__extract_to_ir_values__"):
+        values = val.__extract_to_ir_values__()
         if len(values) == 1:
             return values[0]
     return val
@@ -214,7 +220,7 @@ class CompilationContext:
     - Location trackers for debugging
     """
 
-    _current: Optional["CompilationContext"] = None
+    _current = threading.local()
 
     # Thread-local storage for compile hints (waves_per_eu, maxnreg, etc.)
     _compile_hints = threading.local()
@@ -246,21 +252,32 @@ class CompilationContext:
         self.func_tracker = func_tracker
         self.kernel_trackers: Dict[str, FuncLocationTracker] = {}
         self.stream_arg = None
+        self.link_libs: list = []
+        self._link_libs_seen: set = set()
+        # Callables invoked on each GPU hipModule_t after ExecutionEngine
+        # loads it.  Populated by ExternFunction when module_init_fn is set.
+        self.post_load_processors: list = []
 
     @classmethod
     def get_current(cls) -> Optional["CompilationContext"]:
-        return cls._current
+        return getattr(cls._current, "value", None)
 
     @classmethod
     @contextmanager
     def create(cls, func_tracker: Optional[FuncLocationTracker] = None):
-        prev = cls._current
+        prev = getattr(cls._current, "value", None)
         ctx = CompilationContext(func_tracker)
-        cls._current = ctx
+        cls._current.value = ctx
         try:
             yield ctx
         finally:
-            cls._current = prev
+            cls._current.value = prev
+
+    def add_link_lib(self, path: str) -> None:
+        if path in self._link_libs_seen:
+            return
+        self._link_libs_seen.add(path)
+        self.link_libs.append(path)
 
     def next_kernel_id(self) -> int:
         """Get next unique kernel ID."""
@@ -304,8 +321,6 @@ class KernelLauncher:
     def _check_block_vs_known(self, block_dims: Tuple) -> None:
         """Raise when statically-known *block* dims are invalid for AMDGPU."""
         if self._known_block_size is None:
-            # Without known_block_size the AMDGPU backend assumes
-            # max_flat_workgroup_size = 256.  Error if the launch exceeds that.
             if all(isinstance(v, int) for v in block_dims):
                 total = block_dims[0] * block_dims[1] * block_dims[2]
                 if total > 256:
@@ -352,7 +367,7 @@ class KernelLauncher:
 
         kernel_operands = []
         for arg in self._kernel_args:
-            kernel_operands.extend(fly_values(arg))
+            kernel_operands.extend(extract_to_ir_values(arg))
 
         grid_dims = _normalize_dim(grid)
         block_dims = _normalize_dim(block)
@@ -471,7 +486,7 @@ class KernelFunction:
 
         kernel_arg_types = []
         for value in param_values:
-            kernel_arg_types.extend(fly_types(value))
+            kernel_arg_types.extend(get_ir_types(value))
 
         kernel_id = ctx.next_kernel_id()
         if self._name is not None:
@@ -499,8 +514,8 @@ class KernelFunction:
                 dsl_args: Dict[str, Any] = {}
                 idx = 0
                 for param_name, value in zip(param_names, param_values):
-                    n = len(fly_types(value))
-                    dsl_args[param_name] = fly_construct(type(value), value, list(block_args[idx : idx + n]))
+                    n = len(get_ir_types(value))
+                    dsl_args[param_name] = construct_from_ir_values(type(value), value, list(block_args[idx : idx + n]))
                     idx += n
 
                 dsl_args.update(constexpr_values)

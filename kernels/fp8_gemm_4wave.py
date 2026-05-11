@@ -1,9 +1,3 @@
-import os
-import sys
-
-import torch
-import torch.nn.functional as F
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
@@ -11,24 +5,14 @@ from flydsl.expr import arith, buffer_ops, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-_PYFLYDSL_SRC = os.path.join(_REPO_ROOT, "flydsl", "src")
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
-if _PYFLYDSL_SRC not in sys.path:
-    sys.path.insert(0, _PYFLYDSL_SRC)
-
-from tests.test_common import verify_output, run_perftest
-from tests.utils import pertoken_quant
-
-FP8_DTYPE = torch.float8_e4m3fn
-OUT_DTYPE = torch.bfloat16
 
 def _divmod(a, b):
     return (a // b, a % b)
 
+
 def _min(a, b):
     return arith.select(a < b, a, b)
+
 
 def _xcd_swizzle(num_pid_m, num_pid_n):
     NUM_XCDS = 8
@@ -54,15 +38,8 @@ def _xcd_swizzle(num_pid_m, num_pid_n):
     pid_m = first_pid_m + intra_group_m
     return (pid_m, pid_n)
 
-def compile_fp8_gemm(
-        *,
-        M: int,
-        N: int,
-        K: int,
-        BLOCK_M: int = 256,
-        BLOCK_N: int = 256,
-        use_xcd_remap: bool = True
-):
+
+def compile_fp8_gemm(*, M: int, N: int, K: int, BLOCK_M: int = 256, BLOCK_N: int = 256, use_xcd_remap: bool = True):
     # fixed for MFMA 16x16x128
     BLOCK_K = 128
 
@@ -80,10 +57,10 @@ def compile_fp8_gemm(
     N_BLOCKS = N // BLOCK_N
     K_ITERS = K // BLOCK_K
 
-    N_TILES_A = BLOCK_M // 4 // 16 # this is actually the number of 16-row tiles in a BLOCK_M x BLOCK_N tile
+    N_TILES_A = BLOCK_M // 4 // 16  # this is actually the number of 16-row tiles in a BLOCK_M x BLOCK_N tile
     N_TILES_B = BLOCK_N // 4 // 16
 
-    N_ACCUMS = N_TILES_A * N_TILES_B # Each accumulator is 4 floats (depends on MFMA atom)
+    N_ACCUMS = N_TILES_A * N_TILES_B  # Each accumulator is 4 floats (depends on MFMA atom)
     assert N_ACCUMS > 0
 
     _use_interleaved_block = BLOCK_M == 256 and BLOCK_N == 256
@@ -189,37 +166,39 @@ def compile_fp8_gemm(
             assert len(gl_offsets) >= n_tiles
 
             from flydsl._mlir.dialects import memref as memref_dialect
+
             lds_base_i = memref_dialect.extract_aligned_pointer_as_index(lds_dst)
             for step in range_constexpr(n_tiles):
                 lds_ptr = buffer_ops.create_llvm_ptr(
-                    fx.Int64(lds_base_i + fx.Index(wave_id * 1024 + step * 4096)),
-                    address_space=3
+                    fx.Int64(lds_base_i + fx.Index(wave_id * 1024 + step * 4096)), address_space=3
                 )
                 rocdl.raw_ptr_buffer_load_lds(
-                    gl_src, lds_ptr,
+                    gl_src,
+                    lds_ptr,
                     fx.Int32(16),
-                    fx.Int32(gl_offsets[step]), # voffset
-                    fx.Int32(k_offset), # soffset
+                    fx.Int32(gl_offsets[step]),  # voffset
+                    fx.Int32(k_offset),  # soffset
                     fx.Int32(0),
-                    fx.Int32(0)
+                    fx.Int32(0),
                 )
 
         def _load_one_lds(gl_src, lds_dst, k_offset, gl_offsets, tile_idx):
             assert len(gl_offsets) > tile_idx
 
             from flydsl._mlir.dialects import memref as memref_dialect
+
             lds_base_i = memref_dialect.extract_aligned_pointer_as_index(lds_dst)
             lds_ptr = buffer_ops.create_llvm_ptr(
-                fx.Int64(lds_base_i + fx.Index(wave_id * 1024 + tile_idx * 4096)),
-                address_space=3
+                fx.Int64(lds_base_i + fx.Index(wave_id * 1024 + tile_idx * 4096)), address_space=3
             )
             rocdl.raw_ptr_buffer_load_lds(
-                gl_src, lds_ptr,
+                gl_src,
+                lds_ptr,
                 fx.Int32(16),
-                fx.Int32(gl_offsets[tile_idx]), # voffset
-                fx.Int32(k_offset), # soffset
+                fx.Int32(gl_offsets[tile_idx]),  # voffset
+                fx.Int32(k_offset),  # soffset
                 fx.Int32(0),
-                fx.Int32(0)
+                fx.Int32(0),
             )
 
         def _pack_i32x4_i32x8(lo, hi):
@@ -237,21 +216,23 @@ def compile_fp8_gemm(
                     col = (lane_id // 16) * 16 + step * 64
                     row_swz, col_swz = _swizzle_128(row, col)
                     v = Vec.load(Vec16_t, lds_src, [fx.Index(row_swz * 128 + col_swz)])
-                    halves.append(v.bitcast(fx.Int32)) # i32x4
-                frag.append(_pack_i32x4_i32x8(halves[0], halves[1])) # i32x8
+                    halves.append(v.bitcast(fx.Int32))  # i32x4
+                frag.append(_pack_i32x4_i32x8(halves[0], halves[1]))  # i32x8
             return frag
 
         def _load_one_rt(lds_src, lds_swz, row, k):
             # Load half of a 16x128 tile from LDS to registers
             v = Vec.load(Vec16_t, lds_src, [fx.Index(lds_swz[row][k])])
-            return v.bitcast(fx.Int32) # return a i32x4
+            return v.bitcast(fx.Int32)  # return a i32x4
 
         def _store_C_scaled(c_frag, base_row, base_col):
             def _preload_a_scales():
                 scales = []
                 for i in range_constexpr(N_TILES_A):
                     row = base_row + i * 16 + (lane_id // 16) * 4
-                    scales.append(Vec(buffer_ops.buffer_load(A_scale_rsrc, fx.Int32(row), vec_width=4, dtype=fx.Float32)))
+                    scales.append(
+                        Vec(buffer_ops.buffer_load(A_scale_rsrc, fx.Int32(row), vec_width=4, dtype=fx.Float32))
+                    )
                 return scales
 
             def _preload_b_scales():
@@ -268,7 +249,9 @@ def compile_fp8_gemm(
                 for tj in range_constexpr(N_TILES_B):
                     col = base_col + tj * 16 + lane_id % 16
                     vec_f32 = Vec(c_frag[_c_idx(ti, tj)])
-                    for i in range_constexpr(4): # this is a constant and is equal to the number of floats each thread holds for a 16x16 out tile (depends on mfma atom used)
+                    for i in range_constexpr(
+                        4
+                    ):  # this is a constant and is equal to the number of floats each thread holds for a 16x16 out tile (depends on mfma atom used)
                         scaled = (vec_f32[i] * (a_scales[ti][i] * b_scales[tj])).to(fx.BFloat16)
                         buffer_ops.buffer_store(scaled, C_rsrc, fx.Int32((row + i) * N + col))
 
@@ -278,7 +261,7 @@ def compile_fp8_gemm(
                 operands_=[],
                 asm_string=f"s_waitcnt vmcnt({count})\ns_barrier",
                 constraints="",
-                has_side_effects=True
+                has_side_effects=True,
             )
 
         def _c_idx(i, j):
@@ -291,13 +274,17 @@ def compile_fp8_gemm(
 
             for i in range_constexpr(N_TILES_A):
                 for j in range_constexpr(N_TILES_B):
-                    c[_c_idx(i, j)] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(MfmaAccum_t, [a[i], b[j], c[_c_idx(i, j)], 0, 0, 0, 0x7F7F7F7F, 0, 0x7F7F7F7F])
+                    c[_c_idx(i, j)] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        MfmaAccum_t, [a[i], b[j], c[_c_idx(i, j)], 0, 0, 0, 0x7F7F7F7F, 0, 0x7F7F7F7F]
+                    )
             return c
 
         def _mfma_ABt_one(a, b, c, m, n):
             assert m < N_TILES_A and n < N_TILES_B
 
-            c[_c_idx(m, n)] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(MfmaAccum_t, [a[m], b[n], c[_c_idx(m, n)], 0, 0, 0, 0x7F7F7F7F, 0, 0x7F7F7F7F])
+            c[_c_idx(m, n)] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                MfmaAccum_t, [a[m], b[n], c[_c_idx(m, n)], 0, 0, 0, 0x7F7F7F7F, 0, 0x7F7F7F7F]
+            )
             return c
 
         def _interleaved_cluster(lds_dst, gl_src, k_offset, gl_offsets, wave_idx, lds_src, n_tiles_lds, a, b, c):
@@ -375,7 +362,9 @@ def compile_fp8_gemm(
 
             return c, rt_dst
 
-        def _compute_cluster(lds_dst, gl_src, k_offset, gl_offsets, wave_idx, lds_src, n_tiles_lds, n_tiles_rt, a, b, c):
+        def _compute_cluster(
+            lds_dst, gl_src, k_offset, gl_offsets, wave_idx, lds_src, n_tiles_lds, n_tiles_rt, a, b, c
+        ):
             _load_lds(gl_src, lds_dst, k_offset, gl_offsets, n_tiles_lds)
             rt_dst = _load_rt(lds_src, wave_idx, n_tiles_rt)
             c = _mfma_ABt_all(a, b, c)
@@ -384,26 +373,11 @@ def compile_fp8_gemm(
         def _compute_block(lds_dst, gl_src, k_offset, gl_offsets, wave_idx, lds_src, n_tiles_lds, n_tiles_rt, a, b, c):
             if const_expr(_use_interleaved_block):
                 return _interleaved_cluster(
-                    lds_dst,
-                    gl_src,
-                    k_offset,
-                    gl_offsets,
-                    wave_idx,
-                    lds_src,
-                    n_tiles_lds,
-                    a, b, c
+                    lds_dst, gl_src, k_offset, gl_offsets, wave_idx, lds_src, n_tiles_lds, a, b, c
                 )
             else:
                 return _compute_cluster(
-                    lds_dst,
-                    gl_src,
-                    k_offset,
-                    gl_offsets,
-                    wave_idx,
-                    lds_src,
-                    n_tiles_lds,
-                    n_tiles_rt,
-                    a, b, c
+                    lds_dst, gl_src, k_offset, gl_offsets, wave_idx, lds_src, n_tiles_lds, n_tiles_rt, a, b, c
                 )
 
         # Each wave handles 2x2 64x64 sub-tiles of the output
@@ -428,37 +402,73 @@ def compile_fp8_gemm(
 
         # So far we issued 4 loads for A and 4 loads for B, each load requires N_TILES_A/B memory ops
         # that would be 4 * TILES_A + 4 * TILES_B but since we need a_cur0 it's 3*TILES_A
-        _wait_barrier((3 * N_TILES_A) + (4 * N_TILES_B)) # wait for a_cur0
+        _wait_barrier((3 * N_TILES_A) + (4 * N_TILES_B))  # wait for a_cur0
 
         a0_frag = _load_rt(a_cur0, wave_i, N_TILES_A)
 
-        _wait_barrier((3 * N_TILES_A) + (3 * N_TILES_B)) # wait for b_cur0
+        _wait_barrier((3 * N_TILES_A) + (3 * N_TILES_B))  # wait for b_cur0
 
         b0_frag = _load_rt(b_cur0, wave_j, N_TILES_B)
 
         for k in range_constexpr(K_ITERS - 2):
-            _wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B)) # 2 loads in-flight for each of A/B
+            _wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B))  # 2 loads in-flight for each of A/B
 
             c00_frag, b1_frag = _compute_block(
-                a_cur0, A_rsrc, A0_gl_offset + (k + 2) * BLOCK_K, global_offsets,
-                wave_j, b_cur1, N_TILES_A, N_TILES_B, a0_frag, b0_frag, c00_frag
+                a_cur0,
+                A_rsrc,
+                A0_gl_offset + (k + 2) * BLOCK_K,
+                global_offsets,
+                wave_j,
+                b_cur1,
+                N_TILES_A,
+                N_TILES_B,
+                a0_frag,
+                b0_frag,
+                c00_frag,
             )
 
             c01_frag, a1_frag = _compute_block(
-                b_cur0, B_rsrc, B0_gl_offset + (k + 2) * BLOCK_K, global_offsets,
-                wave_i, a_cur1, N_TILES_B, N_TILES_A, a0_frag, b1_frag, c01_frag
+                b_cur0,
+                B_rsrc,
+                B0_gl_offset + (k + 2) * BLOCK_K,
+                global_offsets,
+                wave_i,
+                a_cur1,
+                N_TILES_B,
+                N_TILES_A,
+                a0_frag,
+                b1_frag,
+                c01_frag,
             )
 
             _wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B))
 
             c10_frag, a0_frag = _compute_block(
-                b_cur1, B_rsrc, B1_gl_offset + (k + 2) * BLOCK_K, global_offsets,
-                wave_i, a_next0, N_TILES_B, N_TILES_A, a1_frag, b0_frag, c10_frag
+                b_cur1,
+                B_rsrc,
+                B1_gl_offset + (k + 2) * BLOCK_K,
+                global_offsets,
+                wave_i,
+                a_next0,
+                N_TILES_B,
+                N_TILES_A,
+                a1_frag,
+                b0_frag,
+                c10_frag,
             )
 
             c11_frag, b0_frag = _compute_block(
-                a_cur1, A_rsrc, A1_gl_offset + (k + 2) * BLOCK_K, global_offsets,
-                wave_j, b_next0, N_TILES_A, N_TILES_B, a1_frag, b1_frag, c11_frag
+                a_cur1,
+                A_rsrc,
+                A1_gl_offset + (k + 2) * BLOCK_K,
+                global_offsets,
+                wave_j,
+                b_next0,
+                N_TILES_A,
+                N_TILES_B,
+                a1_frag,
+                b1_frag,
+                c11_frag,
             )
 
             # Swap cur and next
@@ -532,18 +542,13 @@ def compile_fp8_gemm(
         _store_C_scaled(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
         _store_C_scaled(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
 
-
     @flyc.jit
     def launch_gemm(
-        A: fx.Tensor,
-        B_T: fx.Tensor,
-        C: fx.Tensor,
-        A_scale: fx.Tensor,
-        B_scale: fx.Tensor,
-        stream: fx.Stream
+        A: fx.Tensor, B_T: fx.Tensor, C: fx.Tensor, A_scale: fx.Tensor, B_scale: fx.Tensor, stream: fx.Stream
     ):
         from flydsl._mlir import ir
         from flydsl.compiler.kernel_function import CompilationContext
+
         A_lds_cur0_alloc.finalized = False
         A_lds_cur1_alloc.finalized = False
         A_lds_next0_alloc.finalized = False
@@ -563,145 +568,8 @@ def compile_fp8_gemm(
             B_lds_next0_alloc.finalize()
             B_lds_next1_alloc.finalize()
         grid_x = (M * N) // (BLOCK_M * BLOCK_N)
-        kernel_gemm(A, B_T, C, A_scale, B_scale,
-                    value_attrs={
-                        "rocdl.waves_per_eu": 1,
-                        "rocdl.flat_work_group_size": "256,256"
-                    }
+        kernel_gemm(
+            A, B_T, C, A_scale, B_scale, value_attrs={"rocdl.waves_per_eu": 1, "rocdl.flat_work_group_size": "256,256"}
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
     return launch_gemm
-
-
-# def run_torch(a, b, scale_a, scale_b, dtype=torch.float32):
-#     if scale_a is not None and scale_b is not None:
-#         a_f32 = a.to(torch.float32) * scale_a.view(-1, 1)
-#         b_f32 = b.to(torch.float32) * scale_b.view(-1, 1)
-#     else:
-#         a_f32 = a.to(torch.float32)
-#         b_f32 = b.to(torch.float32)
-#     c = torch.mm(a_f32, b_f32.T)
-#     return c.to(dtype)
-
-
-# def run_scaled_mm(size: int):
-#     M = N = K = size
-#     device = torch.device("cuda")
-#     a_fp32 = torch.rand(M, K, device=device, dtype=torch.float32)
-#     b_fp32_t = torch.rand(N, K, device=device, dtype=torch.float32)
-#     a_q, scale_a = pertoken_quant(a_fp32, quant_dtype=FP8_DTYPE)
-#     b_q, scale_b = pertoken_quant(b_fp32_t, quant_dtype=FP8_DTYPE)
-
-#     a_q = a_q.contiguous()
-#     b_q = b_q.contiguous()
-
-#     b_qt = b_q.t()
-#     scale_b_t = scale_b.t()
-
-#     def _launch(a, b, sa, sb):
-#         F.scaled_mm(
-#             a, b,
-#             scale_a=sa, scale_recipe_a=F.ScalingType.RowWise,
-#             scale_b=sb, scale_recipe_b=F.ScalingType.RowWise,
-#             output_dtype=OUT_DTYPE,
-#         )
-
-#     _, us = run_perftest(
-#         _launch,
-#         a_q,
-#         b_qt,
-#         scale_a,
-#         scale_b_t,
-#         num_iters=100,
-#         num_warmup=20
-#     )
-
-#     tflops = (2 * M * N * K) * 1e-12 / (us * 1e-6)
-#     print(f'torch.scaled_mm perf {M}x{N}x{K} {round(tflops, 1)}TFLOPS')
-
-
-# def check_gemm(size: int, block_m, block_n):
-#     M = N = K = size
-#     device = torch.device("cuda")
-#     a_fp32 = torch.rand(M, K, device=device, dtype=torch.float32)
-#     b_fp32_t = torch.rand(N, K, device=device, dtype=torch.float32)
-#     c_out_raw = torch.zeros((M, N), dtype=OUT_DTYPE, device=device)
-#     a_q, scale_a = pertoken_quant(a_fp32, quant_dtype=FP8_DTYPE)
-#     b_q, scale_b = pertoken_quant(b_fp32_t, quant_dtype=FP8_DTYPE)
-
-#     # a_q = a_q.contiguous()
-#     # b_q = b_q.contiguous()
-#     # scale_a = scale_a.squeeze().contiguous()
-#     # scale_b = scale_b.squeeze().contiguous()
-
-#     out_ref = run_torch(a_q, b_q, scale_a, scale_b)
-
-#     print(f'Testing GEMM with input size: {M}x{N}x{K} block size: {block_m}x{block_n}x128...')
-#     launch_fn = compile_fp8_gemm(M=M, N=N, K=K, BLOCK_M=block_m, BLOCK_N=block_n)
-#     def _as_i8(t):
-#         return t.view(torch.int8) if "float8" in str(t.dtype) else t
-
-#     def _args(c, a, b, sa, sb):
-#         return (
-#             _as_i8(a).contiguous().view(-1),
-#             _as_i8(b).contiguous().view(-1),
-#             c.contiguous().view(-1),
-#             sa.contiguous().view(-1),
-#             sb.contiguous().view(-1),
-#             torch.cuda.current_stream(),
-#         )
-
-#     compiled = flyc.compile(launch_fn, *_args(c_out_raw, a_q, b_q, scale_a, scale_b))
-
-#     compiled(*_args(c_out_raw, a_q, b_q, scale_a, scale_b))
-#     torch.cuda.synchronize()
-
-#     assert verify_output(c_out_raw.to(torch.float32), out_ref, rtol=0.1, atol=0.1)
-
-#     def _launch(c, a, b, sa, sb):
-#         compiled(*_args(c, a, b, sa, sb))
-
-#     if True:
-#         # best = float("+inf")
-#         # for _ in range(10):
-#         #     _launch(c_out_raw, a_q, b_q, scale_a, scale_b)
-
-#         # torch.cuda.synchronize()
-
-#         # for _ in range(100):
-#         #     s = time.perf_counter()
-#         #     _launch(c_out_raw, a_q, b_q, scale_a, scale_b)
-#         #     torch.cuda.synchronize()
-#         #     res = time.perf_counter() - s
-#         #     best = best if res > best else res
-#         _, us = run_perftest(
-#             _launch,
-#             c_out_raw,
-#             a_q,
-#             b_q,
-#             scale_a,
-#             scale_b,
-#             num_iters=100,
-#             num_warmup=20,
-#         )
-
-#         # tflops = (2 * M * N * K) * 1e-12 / best
-#         tflops = (2 * M * N * K) * 1e-12 / (us * 1e-6)
-
-#         print(f'FP8 GEMM SIZE={size} TFLOPS={round(tflops, 1)}')
-
-
-# if __name__ == "__main__":
-#     run_scaled_mm(8*1024)
-#     check_gemm(8*1024, 256, 256)
-#     # valid_sizes = [64, 128, 256]
-
-#     # for b_m in valid_sizes:
-#     #     for b_n in valid_sizes:
-#     #         check_gemm(8*1024, b_m, b_n)
-
-#     # check_gemm(1024*6)
-#     # check_gemm(1024*10)
-#     # check_gemm(1024*12)
-#     # check_gemm(1024*14)
-#     # check_gemm(1024*16)
