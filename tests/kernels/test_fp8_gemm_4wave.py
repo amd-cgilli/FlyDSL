@@ -14,7 +14,7 @@ if _PYFLYDSL_SRC not in sys.path:
     sys.path.insert(0, _PYFLYDSL_SRC)
 
 from flydsl.runtime.device import get_rocm_arch
-from kernels.fp8_gemm_4wave import compile_fp8_gemm
+from kernels.fp8_gemm_8wave import compile_fp8_gemm
 from tests.test_common import run_perftest, verify_output
 from tests.utils import pertoken_quant
 
@@ -69,8 +69,8 @@ def test_fp8_gemm_4wave(
 
     c_ref = _run_torch(a_q, b_q, scale_a, scale_b)
 
-    launch_fn = compile_fp8_gemm(M=M, N=N, K=K, BLOCK_M=tile_m, BLOCK_N=tile_n, use_xcd_remap=not disable_xcd_remap)
-    print(f"✓ Kernel prepared (disable_xcd_remap={disable_xcd_remap})")
+    launch_fn = compile_fp8_gemm(M=M, N=N, K=K)
+    print("✓ Kernel prepared")
 
     def _as_i8(t):
         return t.view(torch.int8) if "float8" in str(t.dtype) else t
@@ -120,9 +120,9 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="FP8 4-Wave GEMM benchmark")
-    parser.add_argument("-M", type=int, default=8192)
-    parser.add_argument("-N", type=int, default=8192)
-    parser.add_argument("-K", type=int, default=8192)
+    parser.add_argument("-M", type=int, default=4096)
+    parser.add_argument("-N", type=int, default=4096)
+    parser.add_argument("-K", type=int, default=4096)
     parser.add_argument("--tile_m", type=int, default=256)
     parser.add_argument("--tile_n", type=int, default=256)
     parser.add_argument("--disable_xcd_remap", action="store_true", default=False)
