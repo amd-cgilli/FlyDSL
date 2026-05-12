@@ -277,7 +277,6 @@ def compile_fp8_gemm(
         k = K_ITERS - 2
         b0_frag = _load_b_rt(b_cur0, wave_n * 32 * BLOCK_K)
         a0_frag = _load_a_rt(a_cur0, wave_m * 64 * BLOCK_K)
-        _load_lds(A_rsrc, a_next1, A1_gl_offset + (k + 2) * BLOCK_K, global_offsets)
         rocdl.s_barrier()
 
         rocdl.s_setprio(1)
@@ -294,7 +293,7 @@ def compile_fp8_gemm(
         rocdl.s_barrier()
 
         a1_frag = _load_a_rt(a_cur1, wave_m * 64 * BLOCK_K)
-        _wait_barrier(4)
+        rocdl.s_barrier()
 
         rocdl.s_setprio(1)
         _mfma_ABt_all(a1_frag, b0_frag, c10_frag)
@@ -347,9 +346,9 @@ def compile_fp8_gemm(
         base_col = block_n * BLOCK_N + wave_n * 32
 
         _store_C_scaled(c00_frag, base_row + 0, base_col + 0)
-        _store_C_scaled(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
-        _store_C_scaled(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
-        _store_C_scaled(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
+        _store_C_scaled(c01_frag, base_row + 0, base_col + 128)
+        _store_C_scaled(c10_frag, base_row + 128, base_col + 0)
+        _store_C_scaled(c11_frag, base_row + 128, base_col + 128)
 
 
     @flyc.jit
