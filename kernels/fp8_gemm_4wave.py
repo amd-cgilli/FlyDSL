@@ -50,9 +50,8 @@ def compile_fp8_gemm(*, M: int, N: int, K: int, BLOCK_M: int = 256, BLOCK_N: int
     assert BLOCK_M >= 64
     assert BLOCK_N >= 64
 
-    assert N % BLOCK_N == 0
-    assert M % BLOCK_M == 0
-    assert K % BLOCK_K == 0
+    assert N % BLOCK_N == 0 and K % BLOCK_K == 0
+    assert M >= 1
 
     N_BLOCKS = N // BLOCK_N
     K_ITERS = K // BLOCK_K
@@ -86,6 +85,12 @@ def compile_fp8_gemm(*, M: int, N: int, K: int, BLOCK_M: int = 256, BLOCK_N: int
     B_lds_cur1_alloc.ptr = b_lds_size
     B_lds_next0_alloc.ptr = b_lds_size
     B_lds_next1_alloc.ptr = b_lds_size
+
+    a_size_bytes = M * K
+    b_size_bytes = N * K
+    c_size_bytes = M * N * 2
+    a_scale_size_bytes = M * 4
+    b_scale_size_bytes = N * 4
 
     @flyc.kernel
     def kernel_gemm(
@@ -126,12 +131,17 @@ def compile_fp8_gemm(*, M: int, N: int, K: int, BLOCK_M: int = 256, BLOCK_N: int
         B0_gl_offset = (tile_j * BLOCK_N) * K
         B1_gl_offset = (tile_j * BLOCK_N + LDS_BLOCK_N) * K
 
-        A_rsrc = buffer_ops.create_buffer_resource(A)
-        B_rsrc = buffer_ops.create_buffer_resource(B_T)
-        C_rsrc = buffer_ops.create_buffer_resource(C)
+        A_rsrc = buffer_ops.create_buffer_resource(A, max_size=False,
+                                                   num_records_bytes=a_size_bytes)
+        B_rsrc = buffer_ops.create_buffer_resource(B_T, max_size=False,
+                                                   num_records_bytes=b_size_bytes)
+        C_rsrc = buffer_ops.create_buffer_resource(C, max_size=False,
+                                                   num_records_bytes=c_size_bytes)
 
-        A_scale_rsrc = buffer_ops.create_buffer_resource(A_scale)
-        B_scale_rsrc = buffer_ops.create_buffer_resource(B_scale)
+        A_scale_rsrc = buffer_ops.create_buffer_resource(A_scale, max_size=False,
+                                                         num_records_bytes=a_scale_size_bytes)
+        B_scale_rsrc = buffer_ops.create_buffer_resource(B_scale, max_size=False,
+                                                         num_records_bytes=b_scale_size_bytes)
 
         def _swizzle_128(row, col):
             offset = row * 128 + col
@@ -179,7 +189,7 @@ def compile_fp8_gemm(*, M: int, N: int, K: int, BLOCK_M: int = 256, BLOCK_N: int
                     fx.Int32(gl_offsets[step]),  # voffset
                     fx.Int32(k_offset),  # soffset
                     fx.Int32(0),
-                    fx.Int32(0),
+                    fx.Int32(1),
                 )
 
         def _load_one_lds(gl_src, lds_dst, k_offset, gl_offsets, tile_idx):
@@ -198,7 +208,7 @@ def compile_fp8_gemm(*, M: int, N: int, K: int, BLOCK_M: int = 256, BLOCK_N: int
                 fx.Int32(gl_offsets[tile_idx]),  # voffset
                 fx.Int32(k_offset),  # soffset
                 fx.Int32(0),
-                fx.Int32(0),
+                fx.Int32(1),
             )
 
         def _pack_i32x4_i32x8(lo, hi):
@@ -567,7 +577,7 @@ def compile_fp8_gemm(*, M: int, N: int, K: int, BLOCK_M: int = 256, BLOCK_N: int
             B_lds_cur1_alloc.finalize()
             B_lds_next0_alloc.finalize()
             B_lds_next1_alloc.finalize()
-        grid_x = (M * N) // (BLOCK_M * BLOCK_N)
+        grid_x = ((M + BLOCK_M - 1) // BLOCK_M) * (N // BLOCK_N)
         kernel_gemm(
             A, B_T, C, A_scale, B_scale, value_attrs={"rocdl.waves_per_eu": 1, "rocdl.flat_work_group_size": "256,256"}
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)

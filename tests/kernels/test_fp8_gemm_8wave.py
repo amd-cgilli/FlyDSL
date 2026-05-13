@@ -119,13 +119,13 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="FP8 8-Wave GEMM benchmark")
-    parser.add_argument("-M", type=int, default=4096)
-    parser.add_argument("-N", type=int, default=4096)
-    parser.add_argument("-K", type=int, default=4096)
-    parser.add_argument("--tile_m", type=int, default=256)
+    parser.add_argument("-M", type=int, default=1)
+    parser.add_argument("-N", type=int, default=3072)
+    parser.add_argument("-K", type=int, default=1536)
+    parser.add_argument("--tile_m", type=int, default=128)
     parser.add_argument("--tile_n", type=int, default=256)
-    parser.add_argument("--num_iters", type=int, default=10)
-    parser.add_argument("--num_warmups", type=int, default=2)
+    parser.add_argument("--num_iters", type=int, default=100)
+    parser.add_argument("--num_warmups", type=int, default=10)
     args = parser.parse_args()
     torch.set_default_device("cuda")
 
