@@ -14,7 +14,7 @@ if _PYFLYDSL_SRC not in sys.path:
     sys.path.insert(0, _PYFLYDSL_SRC)
 
 from flydsl.runtime.device import get_rocm_arch
-from kernels.fp8_gemm_4wave import compile_fp8_gemm
+from kernels.fp8_gemm_8wave import compile_fp8_gemm
 from tests.test_common import run_perftest, verify_output
 from tests.utils import pertoken_quant
 
@@ -37,14 +37,13 @@ def _run_torch(a, b, scale_a, scale_b, dtype=torch.float32):
     return c.to(dtype)
 
 
-def test_fp8_gemm_4wave(
+def test_fp8_gemm_8wave(
     M: int,
     N: int,
     K: int,
     tile_m: int,
     tile_n: int,
     *,
-    disable_xcd_remap: bool = False,
     num_warmups: int = 2,
     num_iters: int = 10,
 ):
@@ -69,11 +68,8 @@ def test_fp8_gemm_4wave(
 
     c_ref = _run_torch(a_q, b_q, scale_a, scale_b)
 
-    launch_fn = compile_fp8_gemm(M=M, N=N, K=K,
-                                 BLOCK_M=tile_m,
-                                 BLOCK_N=tile_n,
-                                 use_xcd_remap=not disable_xcd_remap)
-    print(f"✓ Kernel prepared (BLOCK_M={tile_m} BLOCK_N={tile_n} disable_xcd_remap={disable_xcd_remap})")
+    launch_fn = compile_fp8_gemm(M=M, N=N, K=K, BLOCK_M=tile_m, BLOCK_N=tile_n)
+    print(f"✓ Kernel prepared (BLOCK_M={tile_m} BLOCK_N={tile_n})")
 
     def _as_i8(t):
         return t.view(torch.int8) if "float8" in str(t.dtype) else t
@@ -122,26 +118,24 @@ def test_fp8_gemm_4wave(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="FP8 4-Wave GEMM benchmark")
+    parser = argparse.ArgumentParser(description="FP8 8-Wave GEMM benchmark")
     parser.add_argument("-M", type=int, default=4096)
     parser.add_argument("-N", type=int, default=4096)
     parser.add_argument("-K", type=int, default=4096)
     parser.add_argument("--tile_m", type=int, default=256)
     parser.add_argument("--tile_n", type=int, default=256)
-    parser.add_argument("--disable_xcd_remap", action="store_true", default=False)
     parser.add_argument("--num_iters", type=int, default=10)
     parser.add_argument("--num_warmups", type=int, default=2)
     args = parser.parse_args()
     torch.set_default_device("cuda")
 
     try:
-        test_fp8_gemm_4wave(
+        test_fp8_gemm_8wave(
             M=args.M,
             N=args.N,
             K=args.K,
             tile_m=args.tile_m,
             tile_n=args.tile_n,
-            disable_xcd_remap=args.disable_xcd_remap,
             num_warmups=args.num_warmups,
             num_iters=args.num_iters,
         )
