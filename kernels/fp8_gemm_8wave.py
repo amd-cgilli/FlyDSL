@@ -13,19 +13,30 @@ def compile_fp8_gemm(
         *,
         M: int,
         N: int,
-        K: int
+        K: int,
+        BLOCK_M: int = 256,
+        BLOCK_N: int = 256
 ):
-    BLOCK_M = 256
-    BLOCK_N = 256
     BLOCK_K = 128
 
-    assert M % BLOCK_M == 0 and N % BLOCK_N == 0 and K % BLOCK_K == 0
+    assert M >= 1
+    assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
+    assert N % BLOCK_N == 0 and K % BLOCK_K == 0
 
     N_BLOCKS = N // BLOCK_N
     K_ITERS = K // BLOCK_K
 
+    N_TILES_A = BLOCK_M // 64
+    N_TILES_B = BLOCK_N // 128
+    N_ACCUMS = N_TILES_A * N_TILES_B
+    assert N_ACCUMS > 0
+
     LDS_BLOCK_M = BLOCK_M // 2
     LDS_BLOCK_N = BLOCK_N // 2
+
+    N_LDS_STEPS_A = LDS_BLOCK_M // 64
+    N_LDS_STEPS_B = LDS_BLOCK_N // 64
+    N_LDS_ROUNDS = max(N_LDS_STEPS_A, N_LDS_STEPS_B)
 
     A_lds_cur0_alloc = SmemAllocator(None, "gfx950", "A_lds_cur_0")
     A_lds_cur1_alloc = SmemAllocator(None, "gfx950", "A_lds_cur_1")
@@ -48,6 +59,12 @@ def compile_fp8_gemm(
     B_lds_cur1_alloc.ptr = b_lds_size
     B_lds_next0_alloc.ptr = b_lds_size
     B_lds_next1_alloc.ptr = b_lds_size
+
+    a_size_bytes = M * K
+    b_size_bytes = N * K
+    c_size_bytes = M * N * 2
+    a_scale_size_bytes = M * 4
+    b_scale_size_bytes = N * 4
 
     @flyc.kernel(known_block_size=[512, 1, 1])
     def kernel_gemm(
@@ -76,6 +93,8 @@ def compile_fp8_gemm(
         wave_id = fx.thread_idx.x // 64
         wave_m = wave_id // 4
         wave_n = wave_id % 4
+        wave_n_offset = wave_n * (N_TILES_B * 16)
+        wave_m_offset = wave_m * (N_TILES_A * 16)
         block_m = fx.block_idx.x // N_BLOCKS
         block_n = fx.block_idx.x % N_BLOCKS
 
@@ -84,12 +103,17 @@ def compile_fp8_gemm(
         B0_gl_offset = (block_n * BLOCK_N) * K
         B1_gl_offset = (block_n * BLOCK_N + LDS_BLOCK_N) * K
 
-        A_rsrc = buffer_ops.create_buffer_resource(A)
-        B_rsrc = buffer_ops.create_buffer_resource(B_T)
-        C_rsrc = buffer_ops.create_buffer_resource(C)
+        A_rsrc = buffer_ops.create_buffer_resource(A, max_size=False,
+                                                   num_records_bytes=a_size_bytes)
+        B_rsrc = buffer_ops.create_buffer_resource(B_T, max_size=False,
+                                                   num_records_bytes=b_size_bytes)
+        C_rsrc = buffer_ops.create_buffer_resource(C, max_size=False,
+                                                   num_records_bytes=c_size_bytes)
 
-        A_scale_rsrc = buffer_ops.create_buffer_resource(A_scale)
-        B_scale_rsrc = buffer_ops.create_buffer_resource(B_scale)
+        A_scale_rsrc = buffer_ops.create_buffer_resource(A_scale, max_size=False,
+                                                         num_records_bytes=a_scale_size_bytes)
+        B_scale_rsrc = buffer_ops.create_buffer_resource(B_scale, max_size=False,
+                                                         num_records_bytes=b_scale_size_bytes)
 
         def _swizzle_128(row, col):
             offset = row * 128 + col
@@ -103,26 +127,27 @@ def compile_fp8_gemm(
             row = ((wave_id % 2) * 64 + lane_id) // 8
             col = (lane_id % 8) * 16
             swz_row, swz_col = _swizzle_128(row, col)
-            for round in range_constexpr(2):
+            for round in range_constexpr(N_LDS_ROUNDS):
                 offsets.append(wave_offset + (round * 64 + swz_row) * K + swz_col)
             return offsets
 
-        def _load_lds(gl_src, lds_dst, k_offset, gl_offsets):
+        def _load_lds(gl_src, lds_dst, k_offset, gl_offsets, n_steps):
             from flydsl._mlir.dialects import memref as memref_dialect
 
-            lds_base_i = memref_dialect.extract_aligned_pointer_as_index(lds_dst)
-            for step in range_constexpr(2):
-                lds_ptr = buffer_ops.create_llvm_ptr(
-                    fx.Int64(lds_base_i + fx.Index(wave_id * 1024 + step * 8192)), address_space=3
-                )
+            def _lds_dst_at(step):
+                base_idx = memref_dialect.extract_aligned_pointer_as_index(lds_dst)
+                offset_idx = base_idx + fx.Index(wave_id * 1024 + step * 8192)
+                return buffer_ops.create_llvm_ptr(offset_idx, address_space=3)
+
+            for step in range_constexpr(n_steps):
                 rocdl.raw_ptr_buffer_load_lds(
                     gl_src,
-                    lds_ptr,
+                    _lds_dst_at(step),
                     fx.Int32(16),
                     fx.Int32(gl_offsets[step]),  # voffset
                     fx.Int32(k_offset),  # soffset
                     fx.Int32(0),
-                    fx.Int32(0),
+                    fx.Int32(1),
                 )
 
         def _pack_i32x4_i32x8(lo, hi):
@@ -131,26 +156,25 @@ def compile_fp8_gemm(
 
         def _load_a_rt(lds_src, wave_offset):
             frag = []
-            for k_i in range_constexpr(2):
-                row = lane_id % 16
-                col = (lane_id // 16) * 16 + k_i * 64
-                row_swz, col_swz = _swizzle_128(row, col)
+            for i in range_constexpr(N_TILES_A):
                 halves = []
-                for i in range_constexpr(4):
+                for k_i in range_constexpr(2):
+                    row = lane_id % 16
+                    col = (lane_id // 16) * 16 + k_i * 64
+                    row_swz, col_swz = _swizzle_128(row, col)
                     v = Vec.load(Vec16_t, lds_src, [fx.Index(row_swz * 128 + col_swz + wave_offset + i * 2048)])
                     halves.append(v.bitcast(fx.Int32))
                 frag.append(_pack_i32x4_i32x8(halves[0], halves[1]))
-                frag.append(_pack_i32x4_i32x8(halves[2], halves[3]))
             return frag
 
         def _load_b_rt(lds_src, wave_offset):
             frag = []
-            for k_i in range_constexpr(2):
-                row = lane_id % 16
-                col = (lane_id // 16) * 16 + k_i * 64
-                row_swz, col_swz = _swizzle_128(row, col)
+            for i in range_constexpr(N_TILES_B):
                 halves = []
-                for i in range_constexpr(2):
+                for k_i in range_constexpr(2):
+                    row = lane_id % 16
+                    col = (lane_id // 16) * 16 + k_i * 64
+                    row_swz, col_swz = _swizzle_128(row, col)
                     v = Vec.load(Vec16_t, lds_src, [fx.Index(row_swz * 128 + col_swz + wave_offset + i * 2048)])
                     halves.append(v.bitcast(fx.Int32))
                 frag.append(_pack_i32x4_i32x8(halves[0], halves[1]))
@@ -159,7 +183,7 @@ def compile_fp8_gemm(
         def _store_C_scaled(c_frag, base_row, base_col):
             def _preload_a_scales():
                 scales = []
-                for i in range_constexpr(4):
+                for i in range_constexpr(N_TILES_A):
                     row = base_row + i * 16 + (lane_id // 16) * 4
                     scales.append(
                         Vec(buffer_ops.buffer_load(A_scale_rsrc, fx.Int32(row), vec_width=4, dtype=fx.Float32))
@@ -168,30 +192,28 @@ def compile_fp8_gemm(
 
             def _preload_b_scales():
                 scales = []
-                for i in range_constexpr(2):
+                for i in range_constexpr(N_TILES_B):
                     col = base_col + i * 16 + lane_id % 16
                     scales.append(buffer_ops.buffer_load(B_scale_rsrc, fx.Int32(col), vec_width=1, dtype=fx.Float32))
                 return scales
 
             a_scales = _preload_a_scales()
             b_scales = _preload_b_scales()
-            for ti in range_constexpr(4):
+            for ti in range_constexpr(N_TILES_A):
                 row = base_row + ti * 16 + (lane_id // 16) * 4
-                for tj in range_constexpr(2):
+                for tj in range_constexpr(N_TILES_B):
                     col = base_col + tj * 16 + lane_id % 16
                     vec_f32 = Vec(c_frag[_c_idx(ti, tj)])
-                    for i in range_constexpr(
-                        4
-                    ):
+                    for i in range_constexpr(4):
                         scaled = (vec_f32[i] * (a_scales[ti][i] * b_scales[tj])).to(fx.BFloat16)
                         buffer_ops.buffer_store(scaled, C_rsrc, fx.Int32((row + i) * N + col))
 
         def _c_idx(i, j):
-            return i * 2 + j
+            return i * N_TILES_B + j
 
         def _mfma_ABt_all(a, b, c):
-            for i in range_constexpr(4):
-                for j in range_constexpr(2):
+            for i in range_constexpr(N_TILES_A):
+                for j in range_constexpr(N_TILES_B):
                     c[_c_idx(i, j)] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
                         MfmaAccum_t, [a[i], b[j], c[_c_idx(i, j)], 0, 0, 0, 0x7F7F7F7F, 0, 0x7F7F7F7F]
                     )
@@ -207,33 +229,33 @@ def compile_fp8_gemm(
             )
 
         # 2x2 config of 4x2 (instead of 4x4 in 4wave) 16x16 sub-tiles
-        c00_frag = [RT_C_i] * 8
-        c01_frag = [RT_C_i] * 8
-        c10_frag = [RT_C_i] * 8
-        c11_frag = [RT_C_i] * 8
+        c00_frag = [RT_C_i] * N_ACCUMS
+        c01_frag = [RT_C_i] * N_ACCUMS
+        c10_frag = [RT_C_i] * N_ACCUMS
+        c11_frag = [RT_C_i] * N_ACCUMS
 
         global_offsets = _compute_global_swizzle()
 
-        _load_lds(B_rsrc, b_cur0, B0_gl_offset + 0 * BLOCK_K, global_offsets)
-        _load_lds(A_rsrc, a_cur0, A0_gl_offset + 0 * BLOCK_K, global_offsets)
-        _load_lds(B_rsrc, b_cur1, B1_gl_offset + 0 * BLOCK_K, global_offsets)
-        _load_lds(A_rsrc, a_cur1, A1_gl_offset + 0 * BLOCK_K, global_offsets)
+        _load_lds(B_rsrc, b_cur0, B0_gl_offset + 0 * BLOCK_K, global_offsets, N_LDS_STEPS_B)
+        _load_lds(A_rsrc, a_cur0, A0_gl_offset + 0 * BLOCK_K, global_offsets, N_LDS_STEPS_A)
+        _load_lds(B_rsrc, b_cur1, B1_gl_offset + 0 * BLOCK_K, global_offsets, N_LDS_STEPS_B)
+        _load_lds(A_rsrc, a_cur1, A1_gl_offset + 0 * BLOCK_K, global_offsets, N_LDS_STEPS_A)
 
         if wave_m == 1:
             rocdl.s_barrier()
 
-        _wait_barrier(4)
+        _wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
 
-        _load_lds(B_rsrc, b_next0, B0_gl_offset + 1 * BLOCK_K, global_offsets)
-        _load_lds(A_rsrc, a_next0, A0_gl_offset + 1 * BLOCK_K, global_offsets)
-        _load_lds(B_rsrc, b_next1, B1_gl_offset + 1 * BLOCK_K, global_offsets)
+        _load_lds(B_rsrc, b_next0, B0_gl_offset + 1 * BLOCK_K, global_offsets, N_LDS_STEPS_B)
+        _load_lds(A_rsrc, a_next0, A0_gl_offset + 1 * BLOCK_K, global_offsets, N_LDS_STEPS_A)
+        _load_lds(B_rsrc, b_next1, B1_gl_offset + 1 * BLOCK_K, global_offsets, N_LDS_STEPS_B)
 
-        _wait_barrier(6)
+        _wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
 
         for k in range_constexpr(K_ITERS - 2):
-            b0_frag = _load_b_rt(b_cur0, wave_n * 32 * BLOCK_K)
-            a0_frag = _load_a_rt(a_cur0, wave_m * 64 * BLOCK_K)
-            _load_lds(A_rsrc, a_next1, A1_gl_offset + (k + 1) * BLOCK_K, global_offsets)
+            b0_frag = _load_b_rt(b_cur0, wave_n_offset * BLOCK_K)
+            a0_frag = _load_a_rt(a_cur0, wave_m_offset * BLOCK_K)
+            _load_lds(A_rsrc, a_next1, A1_gl_offset + (k + 1) * BLOCK_K, global_offsets, N_LDS_STEPS_A)
             rocdl.s_barrier()
 
             rocdl.s_setprio(1)
@@ -241,8 +263,8 @@ def compile_fp8_gemm(
             rocdl.s_setprio(0)
             rocdl.s_barrier()
 
-            b1_frag = _load_b_rt(b_cur1, wave_n * 32 * BLOCK_K)
-            _load_lds(B_rsrc, b_cur0, B0_gl_offset + (k + 2) * BLOCK_K, global_offsets)
+            b1_frag = _load_b_rt(b_cur1, wave_n_offset * BLOCK_K)
+            _load_lds(B_rsrc, b_cur0, B0_gl_offset + (k + 2) * BLOCK_K, global_offsets, N_LDS_STEPS_B)
             rocdl.s_barrier()
 
             rocdl.s_setprio(1)
@@ -250,8 +272,8 @@ def compile_fp8_gemm(
             rocdl.s_setprio(0)
             rocdl.s_barrier()
 
-            a1_frag = _load_a_rt(a_cur1, wave_m * 64 * BLOCK_K)
-            _load_lds(A_rsrc, a_cur0, A0_gl_offset + (k + 2) * BLOCK_K, global_offsets)
+            a1_frag = _load_a_rt(a_cur1, wave_m_offset * BLOCK_K)
+            _load_lds(A_rsrc, a_cur0, A0_gl_offset + (k + 2) * BLOCK_K, global_offsets, N_LDS_STEPS_A)
             rocdl.s_barrier()
 
             rocdl.s_setprio(1)
@@ -259,8 +281,8 @@ def compile_fp8_gemm(
             rocdl.s_setprio(0)
             rocdl.s_barrier()
 
-            _load_lds(B_rsrc, b_cur1, B1_gl_offset + (k + 2) * BLOCK_K, global_offsets)
-            _wait_barrier(6)
+            _load_lds(B_rsrc, b_cur1, B1_gl_offset + (k + 2) * BLOCK_K, global_offsets, N_LDS_STEPS_B)
+            _wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
 
             rocdl.s_setprio(1)
             _mfma_ABt_all(a1_frag, b1_frag, c11_frag)
@@ -275,8 +297,8 @@ def compile_fp8_gemm(
 
         # Step k = K_ITERS - 2
         k = K_ITERS - 2
-        b0_frag = _load_b_rt(b_cur0, wave_n * 32 * BLOCK_K)
-        a0_frag = _load_a_rt(a_cur0, wave_m * 64 * BLOCK_K)
+        b0_frag = _load_b_rt(b_cur0, wave_n_offset * BLOCK_K)
+        a0_frag = _load_a_rt(a_cur0, wave_m_offset * BLOCK_K)
         rocdl.s_barrier()
 
         rocdl.s_setprio(1)
@@ -284,7 +306,7 @@ def compile_fp8_gemm(
         rocdl.s_setprio(0)
         rocdl.s_barrier()
 
-        b1_frag = _load_b_rt(b_cur1, wave_n * 32 * BLOCK_K)
+        b1_frag = _load_b_rt(b_cur1, wave_n_offset * BLOCK_K)
         rocdl.s_barrier()
 
         rocdl.s_setprio(1)
@@ -292,7 +314,7 @@ def compile_fp8_gemm(
         rocdl.s_setprio(0)
         rocdl.s_barrier()
 
-        a1_frag = _load_a_rt(a_cur1, wave_m * 64 * BLOCK_K)
+        a1_frag = _load_a_rt(a_cur1, wave_m_offset * BLOCK_K)
         rocdl.s_barrier()
 
         rocdl.s_setprio(1)
@@ -300,7 +322,7 @@ def compile_fp8_gemm(
         rocdl.s_setprio(0)
         rocdl.s_barrier()
 
-        b0_frag = _load_b_rt(b_next0, wave_n * 32 * BLOCK_K)
+        b0_frag = _load_b_rt(b_next0, wave_n_offset * BLOCK_K)
         rocdl.s_barrier()
 
         rocdl.s_setprio(1)
@@ -316,7 +338,7 @@ def compile_fp8_gemm(
 
         # Step k = K_ITERS - 1
         k = K_ITERS - 1
-        a0_frag = _load_a_rt(a_cur0, wave_m * 64 * BLOCK_K)
+        a0_frag = _load_a_rt(a_cur0, wave_m_offset * BLOCK_K)
         _wait_barrier(0)
 
         rocdl.s_setprio(1)
@@ -324,7 +346,7 @@ def compile_fp8_gemm(
         rocdl.s_setprio(0)
         rocdl.s_barrier()
 
-        b1_frag = _load_b_rt(b_cur1, wave_n * 32 * BLOCK_K)
+        b1_frag = _load_b_rt(b_cur1, wave_n_offset * BLOCK_K)
         rocdl.s_barrier()
 
         rocdl.s_setprio(1)
@@ -332,7 +354,7 @@ def compile_fp8_gemm(
         rocdl.s_setprio(0)
         rocdl.s_barrier()
 
-        a1_frag = _load_a_rt(a_cur1, wave_m * 64 * BLOCK_K)
+        a1_frag = _load_a_rt(a_cur1, wave_m_offset * BLOCK_K)
         rocdl.s_barrier()
 
         rocdl.s_setprio(1)
@@ -342,13 +364,13 @@ def compile_fp8_gemm(
         rocdl.s_barrier()
 
         # Scale and store back to gmem
-        base_row = block_m * BLOCK_M + wave_m * 64
-        base_col = block_n * BLOCK_N + wave_n * 32
+        base_row = block_m * BLOCK_M + wave_m_offset
+        base_col = block_n * BLOCK_N + wave_n_offset
 
         _store_C_scaled(c00_frag, base_row + 0, base_col + 0)
-        _store_C_scaled(c01_frag, base_row + 0, base_col + 128)
-        _store_C_scaled(c10_frag, base_row + 128, base_col + 0)
-        _store_C_scaled(c11_frag, base_row + 128, base_col + 128)
+        _store_C_scaled(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
+        _store_C_scaled(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
+        _store_C_scaled(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
 
 
     @flyc.jit
@@ -381,7 +403,7 @@ def compile_fp8_gemm(
             B_lds_cur1_alloc.finalize()
             B_lds_next0_alloc.finalize()
             B_lds_next1_alloc.finalize()
-        grid_x = (M * N) // (BLOCK_M * BLOCK_N)
+        grid_x = ((M + BLOCK_M - 1) // BLOCK_M) * (N // BLOCK_N)
         kernel_gemm(
             A,
             B_T,
