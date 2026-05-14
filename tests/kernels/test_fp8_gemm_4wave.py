@@ -14,7 +14,7 @@ if _PYFLYDSL_SRC not in sys.path:
     sys.path.insert(0, _PYFLYDSL_SRC)
 
 from flydsl.runtime.device import get_rocm_arch
-from kernels.fp8_gemm_4wave import compile_fp8_gemm
+from kernels.fp8_gemm_4wave_splitk_atomics import compile_fp8_gemm
 from tests.test_common import run_perftest, verify_output
 from tests.utils import pertoken_quant
 
@@ -44,6 +44,7 @@ def test_fp8_gemm_4wave(
     tile_m: int,
     tile_n: int,
     *,
+    num_splits: int = 1,
     disable_xcd_remap: bool = False,
     num_warmups: int = 2,
     num_iters: int = 10,
@@ -69,35 +70,60 @@ def test_fp8_gemm_4wave(
 
     c_ref = _run_torch(a_q, b_q, scale_a, scale_b)
 
-    launch_fn = compile_fp8_gemm(M=M, N=N, K=K,
-                                 BLOCK_M=tile_m,
-                                 BLOCK_N=tile_n,
-                                 use_xcd_remap=not disable_xcd_remap)
-    print(f"✓ Kernel prepared (BLOCK_M={tile_m} BLOCK_N={tile_n} disable_xcd_remap={disable_xcd_remap})")
+    IS_SPLIT_K = num_splits > 1
+    M_PAD = ((M + tile_m - 1) // tile_m) * tile_m
+    if IS_SPLIT_K:
+        c_workspace = torch.zeros((num_splits, M_PAD, N), dtype=torch.float32, device=device)
+    else:
+        c_workspace = torch.empty(0, dtype=torch.float32, device=device)
+
+    launch_gemm_fn, launch_reduce_fn = compile_fp8_gemm(
+        M=M, N=N, K=K,
+        BLOCK_M=tile_m,
+        BLOCK_N=tile_n,
+        NUM_SPLITS=num_splits,
+        use_xcd_remap=not disable_xcd_remap)
+    print(f"✓ Kernel prepared (M={M} N={N} K={K} BLOCK_M={tile_m} BLOCK_N={tile_n} "
+          f"NUM_SPLITS={num_splits} disable_xcd_remap={disable_xcd_remap})")
 
     def _as_i8(t):
         return t.view(torch.int8) if "float8" in str(t.dtype) else t
 
-    def _args(c, a, b, sa, sb):
+    stream = torch.cuda.current_stream()
+
+    def _gemm_args(c, ws, a, b, sa, sb):
         return (
             _as_i8(a).contiguous().view(-1),
             _as_i8(b).contiguous().view(-1),
             c.contiguous().view(-1),
+            ws.contiguous().view(-1),
             sa.contiguous().view(-1),
             sb.contiguous().view(-1),
-            torch.cuda.current_stream(),
+            stream,
         )
 
-    compiled = flyc.compile(launch_fn, *_args(c_out_raw, a_q, b_q, scale_a, scale_b))
+    def _reduce_args(ws, c):
+        return (
+            ws.contiguous().view(-1),
+            c.contiguous().view(-1),
+            stream,
+        )
 
-    def _launch(c, a, b, sa, sb):
-        compiled(*_args(c, a, b, sa, sb))
+    compiled_gemm = flyc.compile(launch_gemm_fn, *_gemm_args(c_out_raw, c_workspace, a_q, b_q, scale_a, scale_b))
+    if IS_SPLIT_K:
+        compiled_reduce = flyc.compile(launch_reduce_fn, *_reduce_args(c_workspace, c_out_raw))
+
+    def _launch(c, ws, a, b, sa, sb):
+        compiled_gemm(*_gemm_args(c, ws, a, b, sa, sb))
+        if IS_SPLIT_K:
+            compiled_reduce(*_reduce_args(ws, c))
 
     num_iters = max(2, int(num_iters))
 
     _, us = run_perftest(
         _launch,
         c_out_raw,
+        c_workspace,
         a_q,
         b_q,
         scale_a,
@@ -114,36 +140,40 @@ def test_fp8_gemm_4wave(
     flops = 2 * M * N * K
     tflops = flops / (us / 1e6) / 1e12
     tbps = bytes_moved / 1e12 / (us / 1e6)
-    print(f"[flyc] Throughput: {us:.1f} us, {tflops:.2f} TFLOPS, BW: {tbps:.3f} TB/s")
+    print(f"[flyc] Throughput: {us:.1f} us, {tflops:.2f} TFLOPS, BW: {tbps:.3f} TB/s\n")
 
     return tflops
 
 
-if __name__ == "__main__":
-    import argparse
+DS_SMALL_SHAPES = [(1, 256, 7168), # 4 cus (64x64 best)
+                   (1, 2112, 7168), # 33 (64x64)
+                   (1, 3072, 1536), # 48 (64x64)
+                   (1, 4096, 512), # 64 (64x64)
+                   (1, 6144, 1536), # 96 (64x64)
+                   (1, 7168, 4096) # 112 (64x64)
+                   ]
 
-    parser = argparse.ArgumentParser(description="FP8 4-Wave GEMM benchmark")
-    parser.add_argument("-M", type=int, default=1)
-    parser.add_argument("-N", type=int, default=3072)
-    parser.add_argument("-K", type=int, default=1536)
-    parser.add_argument("--tile_m", type=int, default=64)
-    parser.add_argument("--tile_n", type=int, default=64)
-    parser.add_argument("--disable_xcd_remap", action="store_true", default=False)
-    parser.add_argument("--num_iters", type=int, default=100)
-    parser.add_argument("--num_warmups", type=int, default=10)
-    args = parser.parse_args()
+BLOCK_K = 128
+
+
+def _valid_splits(K):
+    k_iters = K // BLOCK_K
+    return [s for s in range(1, k_iters + 1)
+            if k_iters % s == 0 and k_iters // s >= 2]
+
+
+if __name__ == "__main__":
     torch.set_default_device("cuda")
 
-    try:
-        test_fp8_gemm_4wave(
-            M=args.M,
-            N=args.N,
-            K=args.K,
-            tile_m=args.tile_m,
-            tile_n=args.tile_n,
-            disable_xcd_remap=args.disable_xcd_remap,
-            num_warmups=args.num_warmups,
-            num_iters=args.num_iters,
-        )
-    except pytest.skip.Exception as e:
-        print(f"Skipped: {e}")
+    for m, n, k in DS_SMALL_SHAPES:
+        bm = bn = 64
+        splits = _valid_splits(k)
+        print(f"--- M={m} N={n} K={k} valid splits: {splits} ---")
+        for ns in splits:
+            test_fp8_gemm_4wave(
+                M=m, N=n, K=k,
+                tile_m=bm, tile_n=bn,
+                num_splits=ns,
+                num_iters=100,
+                num_warmups=10
+            )
