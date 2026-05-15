@@ -26,7 +26,9 @@ from kernels.fp8_gemm_utils import (
     G2SLoader,
     Mfma16x16x128,
     S2RLoader,
+    SplitK,
     StoreC,
+    ceildiv,
     compute_global_swizzle,
     make_fp8_buffer_tensor,
     pack_i32x4_i32x8,
@@ -76,6 +78,7 @@ def compile_fp8_gemm_4w(
     BLOCK_N: int = 256,
     use_xcd_remap: bool = True,
     b_preshuffled: bool = False,
+    n_splits: int = 1
 ):
     # MFMA atom is 16x16x128; 4 waves in a 2x2 config require BLOCK >= 64.
     BLOCK_K = 128
@@ -86,8 +89,21 @@ def compile_fp8_gemm_4w(
     assert BLOCK_M >= 64 and BLOCK_M % 64 == 0 and BLOCK_N >= 64 and BLOCK_N % 64 == 0
     assert K % BLOCK_K == 0
 
-    N_BLOCKS = (N + BLOCK_N - 1) // BLOCK_N
-    K_ITERS = K // BLOCK_K
+    assert n_splits >= 1
+    assert K % n_splits == 0, f"K ({K}) must be divisible by n_splits ({n_splits})"
+    K_PER_SPLIT = K // n_splits
+    assert K_PER_SPLIT % BLOCK_K == 0, f"K_PER_SPLIT ({K_PER_SPLIT}) must be divisible by BLOCK_K ({BLOCK_K})"
+    K_ITERS_PER_SPLIT = K_PER_SPLIT // BLOCK_K
+    assert K_ITERS_PER_SPLIT >= 2, (
+        f"Each split needs >= 2 K iterations for double-buffered prologue, "
+        f"got {K_ITERS_PER_SPLIT} (K={K}, n_splits={n_splits}, BLOCK_K={BLOCK_K})"
+    )
+    _is_split_k = n_splits > 1
+
+    _m_pad = ceildiv(M, BLOCK_M) * BLOCK_M
+
+    N_BLOCKS = ceildiv(N, BLOCK_N)
+    K_ITERS = K_PER_SPLIT // BLOCK_K
     # Number of 16-row 16x128 tiles per wave per A/B partition.
     N_TILES_A = BLOCK_M // 4 // 16
     N_TILES_B = BLOCK_N // 4 // 16
@@ -149,11 +165,15 @@ def compile_fp8_gemm_4w(
 
         wave_i = wave_id // 2
         wave_j = wave_id % 2
-        A0_gl_offset = (tile_i * BLOCK_M) * K
-        A1_gl_offset = (tile_i * BLOCK_M + LDS_BLOCK_M) * K
+
+        split_k_idx = fx.block_idx.y
+        k_base = split_k_idx * K_PER_SPLIT
+
+        A0_gl_offset = (tile_i * BLOCK_M) * K + k_base
+        A1_gl_offset = (tile_i * BLOCK_M + LDS_BLOCK_M) * K + k_base
         A_K_STEP = BLOCK_K
-        B0_gl_offset = (tile_j * BLOCK_N) * K
-        B1_gl_offset = (tile_j * BLOCK_N + LDS_BLOCK_N) * K
+        B0_gl_offset = (tile_j * BLOCK_N) * K + k_base
+        B1_gl_offset = (tile_j * BLOCK_N + LDS_BLOCK_N) * K + k_base
         B_K_STEP = (2 * 1024) if b_preshuffled else BLOCK_K
 
         gA = make_fp8_buffer_tensor(A, F8_IR_t)
@@ -308,7 +328,7 @@ def compile_fp8_gemm_4w(
         b_g2s = G2SLoader(gb_div, gl_off_b, N_TILES_B, F8_IR_t, wave_id)
         a_s2r = S2RLoader(wave_i, N_TILES_A)
         b_s2r = S2RLoader(wave_j, N_TILES_B)
-        store_c = StoreC(A_scale, B_scale, C, M, N, mfma.idx, N_TILES_A, N_TILES_B)
+        store_c = StoreC(A_scale, B_scale, C, M, N, mfma.idx, N_TILES_A, N_TILES_B, _is_split_k, _m_pad)
 
         # Prologue: 8-buffer LDS pipeline pre-fill.
         a_g2s.load(a_cur0, A0_gl_offset + 0 * A_K_STEP)
@@ -457,4 +477,23 @@ def compile_fp8_gemm_4w(
             value_attrs={"rocdl.waves_per_eu": 1, "rocdl.flat_work_group_size": "256,256"},
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
-    return launch_gemm
+    if not _is_split_k:
+        return launch_gemm, None
+
+
+    @flyc.kernel
+    def reduce_kernel(C_ws: fx.Tensor, C: fx.Tensor):
+        split_k = SplitK(C_ws, C, M, N, _m_pad, n_splits)
+        split_k.reduce()
+
+
+    @flyc.jit
+    def launch_reduce(C_ws: fx.Tensor, C: fx.Tensor, stream: fx.Stream):
+        total_elems = M * N
+        reduce_kernel(
+            C_ws, C
+        ).launch(grid=(ceildiv(total_elems, SplitK._REDUCE_ELEMS_PER_BLOCK), 1, 1),
+                 block=(SplitK._REDUCE_BLOCK, 1, 1), stream=stream)
+
+    return launch_gemm, launch_reduce
+
