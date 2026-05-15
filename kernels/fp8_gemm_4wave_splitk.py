@@ -76,8 +76,6 @@ def compile_fp8_gemm(
     N_ACCUMS = N_TILES_A * N_TILES_B  # Each accumulator is 4 floats (depends on MFMA atom)
     assert N_ACCUMS > 0
 
-    _use_interleaved_block = BLOCK_M == 256 and BLOCK_N == 256
-
     A_lds_cur0_alloc = SmemAllocator(None, "gfx950", "A_lds_cur_0")
     A_lds_cur1_alloc = SmemAllocator(None, "gfx950", "A_lds_cur_1")
     A_lds_next0_alloc = SmemAllocator(None, "gfx950", "A_lds_next_0")
@@ -467,32 +465,32 @@ def compile_fp8_gemm(
         return launch_gemm, None
 
     REDUCE_BLOCK = 256
+    REDUCE_VEC = 4
+    REDUCE_ELEMS_PER_BLOCK = REDUCE_BLOCK * REDUCE_VEC
 
-    @flyc.kernel(known_block_size=[REDUCE_BLOCK, 1, 1])
+    @flyc.kernel
     def reduce_kernel(C_workspace: fx.Tensor, C: fx.Tensor):
         C_ws_rsrc = buffer_ops.create_buffer_resource(
             C_workspace, max_size=False, num_records_bytes=NUM_SPLITS * workspace_size_bytes
         )
         C_rsrc = buffer_ops.create_buffer_resource(C, max_size=False, num_records_bytes=c_size_bytes)
 
-        idx = fx.block_idx.x * REDUCE_BLOCK + fx.thread_idx.x
+        base_idx = fx.block_idx.x * REDUCE_ELEMS_PER_BLOCK + fx.thread_idx.x * REDUCE_VEC
         total_elems = M * N
-        if idx < total_elems:
-            row = idx // N
-            col = idx % N
-            acc = fx.Float32(0.0)
-            for s in range_constexpr(NUM_SPLITS):
-                ws_offset = s * M_PAD * N + row * N + col
-                val = fx.Float32(buffer_ops.buffer_load(C_ws_rsrc, fx.Int32(ws_offset), vec_width=1, dtype=fx.Float32))
+        if base_idx < total_elems:
+            acc = Vec(buffer_ops.buffer_load(C_ws_rsrc, fx.Int32(base_idx), vec_width=4, dtype=fx.Float32))
+            for s in range_constexpr(NUM_SPLITS - 1):
+                ws_offset = (s + 1) * M_PAD * N + base_idx
+                val = Vec(buffer_ops.buffer_load(C_ws_rsrc, fx.Int32(ws_offset), vec_width=4, dtype=fx.Float32))
                 acc = acc + val
-            buffer_ops.buffer_store(acc.to(fx.BFloat16), C_rsrc, fx.Int32(idx))
+            buffer_ops.buffer_store(acc.to(fx.BFloat16), C_rsrc, fx.Int32(base_idx))
 
     @flyc.jit
     def launch_reduce(C_workspace: fx.Tensor, C: fx.Tensor, stream: fx.Stream):
         total_elems = M * N
-        grid_x = (total_elems + REDUCE_BLOCK - 1) // REDUCE_BLOCK
+        grid_x = (total_elems + REDUCE_ELEMS_PER_BLOCK - 1) // REDUCE_ELEMS_PER_BLOCK
         reduce_kernel(
-            C_workspace, C, value_attrs={"rocdl.waves_per_eu": 1, "rocdl.flat_work_group_size": "256,256"}
+            C_workspace, C
         ).launch(grid=(grid_x, 1, 1), block=(REDUCE_BLOCK, 1, 1), stream=stream)
 
     return launch_gemm, launch_reduce

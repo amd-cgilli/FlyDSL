@@ -14,7 +14,7 @@ if _PYFLYDSL_SRC not in sys.path:
     sys.path.insert(0, _PYFLYDSL_SRC)
 
 from flydsl.runtime.device import get_rocm_arch
-from kernels.fp8_gemm_4wave_splitk_atomics import compile_fp8_gemm
+from kernels.fp8_gemm_4wave_splitk import compile_fp8_gemm
 from tests.test_common import run_perftest, verify_output
 from tests.utils import pertoken_quant
 

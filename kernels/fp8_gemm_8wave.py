@@ -4,7 +4,7 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import buffer_ops, range_constexpr, rocdl
+from flydsl.expr import buffer_ops, const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
@@ -15,16 +15,28 @@ def compile_fp8_gemm(
         N: int,
         K: int,
         BLOCK_M: int = 256,
-        BLOCK_N: int = 256
+        BLOCK_N: int = 256,
+        NUM_SPLITS: int = 1
 ):
     BLOCK_K = 128
 
-    assert M >= 1
+    assert M >= 1 and N >= 1
     assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
-    assert N % BLOCK_N == 0 and K % BLOCK_K == 0
+    assert K % BLOCK_K == 0
+
+    assert NUM_SPLITS >= 1
+    assert K % NUM_SPLITS == 0, f"K ({K}) must be divisible by NUM_SPLITS ({NUM_SPLITS})"
+    K_PER_SPLIT = K // NUM_SPLITS
+    assert K_PER_SPLIT % BLOCK_K == 0, f"K_PER_SPLIT ({K_PER_SPLIT}) must be divisible by BLOCK_K ({BLOCK_K})"
+    K_ITERS_PER_SPLIT = K_PER_SPLIT // BLOCK_K
+    assert K_ITERS_PER_SPLIT >= 2, (
+        f"Each split needs >= 2 K iterations for double-buffered prologue, "
+        f"got {K_ITERS_PER_SPLIT} (K={K}, NUM_SPLITS={NUM_SPLITS}, BLOCK_K={BLOCK_K})"
+    )
+    IS_SPLIT_K = NUM_SPLITS > 1
 
     N_BLOCKS = N // BLOCK_N
-    K_ITERS = K // BLOCK_K
+    K_ITERS = K_PER_SPLIT // BLOCK_K
 
     N_TILES_A = BLOCK_M // 64
     N_TILES_B = BLOCK_N // 128
@@ -60,17 +72,21 @@ def compile_fp8_gemm(
     B_lds_next0_alloc.ptr = b_lds_size
     B_lds_next1_alloc.ptr = b_lds_size
 
+    M_PAD = ((M + BLOCK_M - 1) // BLOCK_M) * BLOCK_M
+
     a_size_bytes = M * K
     b_size_bytes = N * K
     c_size_bytes = M * N * 2
     a_scale_size_bytes = M * 4
     b_scale_size_bytes = N * 4
+    workspace_size_bytes = M_PAD * N * 4  # f32 per split slice, padded to BLOCK_M rows
 
     @flyc.kernel(known_block_size=[512, 1, 1])
     def kernel_gemm(
         A: fx.Tensor,
         B_T: fx.Tensor,
         C: fx.Tensor,
+        C_workspace: fx.Tensor,
         A_scale: fx.Tensor,
         B_scale: fx.Tensor,
     ):
@@ -98,10 +114,13 @@ def compile_fp8_gemm(
         block_m = fx.block_idx.x // N_BLOCKS
         block_n = fx.block_idx.x % N_BLOCKS
 
-        A0_gl_offset = (block_m * BLOCK_M) * K
-        A1_gl_offset = (block_m * BLOCK_M + LDS_BLOCK_M) * K
-        B0_gl_offset = (block_n * BLOCK_N) * K
-        B1_gl_offset = (block_n * BLOCK_N + LDS_BLOCK_N) * K
+        split_k_idx = fx.block_idx.y
+        k_base = split_k_idx * K_PER_SPLIT
+
+        A0_gl_offset = (block_m * BLOCK_M) * K + k_base
+        A1_gl_offset = (block_m * BLOCK_M + LDS_BLOCK_M) * K + k_base
+        B0_gl_offset = (block_n * BLOCK_N) * K + k_base
+        B1_gl_offset = (block_n * BLOCK_N + LDS_BLOCK_N) * K + k_base
 
         A_rsrc = buffer_ops.create_buffer_resource(A, max_size=False,
                                                    num_records_bytes=a_size_bytes)
@@ -109,7 +128,10 @@ def compile_fp8_gemm(
                                                    num_records_bytes=b_size_bytes)
         C_rsrc = buffer_ops.create_buffer_resource(C, max_size=False,
                                                    num_records_bytes=c_size_bytes)
-
+        if const_expr(IS_SPLIT_K):
+            C_ws_rsrc = buffer_ops.create_buffer_resource(
+                C_workspace, max_size=False, num_records_bytes=NUM_SPLITS * workspace_size_bytes
+            )
         A_scale_rsrc = buffer_ops.create_buffer_resource(A_scale, max_size=False,
                                                          num_records_bytes=a_scale_size_bytes)
         B_scale_rsrc = buffer_ops.create_buffer_resource(B_scale, max_size=False,
@@ -205,8 +227,12 @@ def compile_fp8_gemm(
                     col = base_col + tj * 16 + lane_id % 16
                     vec_f32 = Vec(c_frag[_c_idx(ti, tj)])
                     for i in range_constexpr(4):
-                        scaled = (vec_f32[i] * (a_scales[ti][i] * b_scales[tj])).to(fx.BFloat16)
-                        buffer_ops.buffer_store(scaled, C_rsrc, fx.Int32((row + i) * N + col))
+                        scaled = vec_f32[i] * (a_scales[ti][i] * b_scales[tj])
+                        if const_expr(IS_SPLIT_K):
+                            ws_offset = split_k_idx * M_PAD * N + (row + i) * N + col
+                            buffer_ops.buffer_store(scaled, C_ws_rsrc, fx.Int32(ws_offset))
+                        else:
+                            buffer_ops.buffer_store(scaled.to(fx.BFloat16), C_rsrc, fx.Int32((row + i) * N + col))
 
         def _c_idx(i, j):
             return i * N_TILES_B + j
@@ -378,6 +404,7 @@ def compile_fp8_gemm(
         A: fx.Tensor,
         B_T: fx.Tensor,
         C: fx.Tensor,
+        C_workspace: fx.Tensor,
         A_scale: fx.Tensor,
         B_scale: fx.Tensor,
         stream: fx.Stream,
@@ -408,10 +435,44 @@ def compile_fp8_gemm(
             A,
             B_T,
             C,
+            C_workspace,
             A_scale,
             B_scale,
             value_attrs={"rocdl.waves_per_eu": 2, "rocdl.flat_work_group_size": "512,512"},
-        ).launch(grid=(grid_x, 1, 1), block=(512, 1, 1), stream=stream)
+        ).launch(grid=(grid_x, NUM_SPLITS, 1), block=(512, 1, 1), stream=stream)
 
-    return launch_gemm
+    if not IS_SPLIT_K:
+        return launch_gemm, None
+
+    REDUCE_BLOCK = 256
+    REDUCE_VEC = 4
+    REDUCE_ELEMS_PER_BLOCK = REDUCE_BLOCK * REDUCE_VEC
+
+    @flyc.kernel
+    def reduce_kernel(C_workspace: fx.Tensor, C: fx.Tensor):
+        C_ws_rsrc = buffer_ops.create_buffer_resource(
+            C_workspace, max_size=False, num_records_bytes=NUM_SPLITS * workspace_size_bytes
+        )
+        C_rsrc = buffer_ops.create_buffer_resource(C, max_size=False, num_records_bytes=c_size_bytes)
+
+        base_idx = fx.block_idx.x * REDUCE_ELEMS_PER_BLOCK + fx.thread_idx.x * REDUCE_VEC
+        total_elems = M * N
+        if base_idx < total_elems:
+            acc = Vec(buffer_ops.buffer_load(C_ws_rsrc, fx.Int32(base_idx), vec_width=4, dtype=fx.Float32))
+            for s in range_constexpr(NUM_SPLITS - 1):
+                ws_offset = (s + 1) * M_PAD * N + base_idx
+                val = Vec(buffer_ops.buffer_load(C_ws_rsrc, fx.Int32(ws_offset), vec_width=4, dtype=fx.Float32))
+                acc = acc + val
+            buffer_ops.buffer_store(acc.to(fx.BFloat16), C_rsrc, fx.Int32(base_idx))
+
+    @flyc.jit
+    def launch_reduce(C_workspace: fx.Tensor, C: fx.Tensor, stream: fx.Stream):
+        total_elems = M * N
+        grid_x = (total_elems + REDUCE_ELEMS_PER_BLOCK - 1) // REDUCE_ELEMS_PER_BLOCK
+        reduce_kernel(
+            C_workspace, C
+        ).launch(grid=(grid_x, 1, 1), block=(REDUCE_BLOCK, 1, 1), stream=stream)
+
+    return launch_gemm, launch_reduce
+
 
