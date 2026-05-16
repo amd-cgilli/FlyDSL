@@ -7,7 +7,7 @@ from flydsl._mlir.dialects import fly as fly_dialect
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects import memref as memref_dialect
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
-from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr
+from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr.typing import Vector as Vec
 
 
@@ -224,30 +224,3 @@ class Mfma16x16x128:
         assert i < self.n_tiles_a and j < self.n_tiles_b
 
         return self._do_mma(a[i], b[j], c[self.idx(i, j)])
-
-
-class SplitK:
-    _REDUCE_BLOCK = 256
-    _REDUCE_VEC = 4
-    _REDUCE_ELEMS_PER_BLOCK = _REDUCE_BLOCK * _REDUCE_VEC
-
-    def __init__(self, C_ws, C, M, N, m_pad, n_splits):
-        self.c_ws_rsrc = buffer_ops.create_buffer_resource(
-            C_ws, max_size=False, num_records_bytes=n_splits * (m_pad * N * 4)
-        )
-        self.c_rsrc = buffer_ops.create_buffer_resource(C, max_size=False, num_records_bytes=M * N * 2)
-        self.m = M
-        self.n = N
-        self.m_pad = m_pad
-        self.n_splits = n_splits
-
-    def reduce(self):
-        base_idx = fx.block_idx.x * SplitK._REDUCE_ELEMS_PER_BLOCK + fx.thread_idx.x * SplitK._REDUCE_VEC
-        total_elems = self.m * self.n
-        if base_idx < total_elems:
-            acc = Vec(buffer_ops.buffer_load(self.c_ws_rsrc, fx.Int32(base_idx), vec_width=4, dtype=fx.Float32))
-            for s in range_constexpr(self.n_splits - 1):
-                ws_offset = (s + 1) * self.m_pad * self.n + base_idx
-                val = Vec(buffer_ops.buffer_load(self.c_ws_rsrc, fx.Int32(ws_offset), vec_width=4, dtype=fx.Float32))
-                acc = acc + val
-            buffer_ops.buffer_store(acc.to(fx.BFloat16), self.c_rsrc, fx.Int32(base_idx))

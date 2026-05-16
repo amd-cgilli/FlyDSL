@@ -20,13 +20,13 @@ Optional B preshuffle uses the same on-disk layout as
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, const_expr, range_constexpr
+from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr
+from flydsl.expr.typing import Vector as Vec
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from kernels.fp8_gemm_utils import (
     G2SLoader,
     Mfma16x16x128,
     S2RLoader,
-    SplitK,
     StoreC,
     ceildiv,
     compute_global_swizzle,
@@ -140,6 +140,7 @@ def compile_fp8_gemm_4w(
         A: fx.Tensor,
         B_T: fx.Tensor,
         C: fx.Tensor,
+        C_workspace: fx.Tensor,
         A_scale: fx.Tensor,
         B_scale: fx.Tensor,
     ):
@@ -328,7 +329,7 @@ def compile_fp8_gemm_4w(
         b_g2s = G2SLoader(gb_div, gl_off_b, N_TILES_B, F8_IR_t, wave_id)
         a_s2r = S2RLoader(wave_i, N_TILES_A)
         b_s2r = S2RLoader(wave_j, N_TILES_B)
-        store_c = StoreC(A_scale, B_scale, C, M, N, mfma.idx, N_TILES_A, N_TILES_B, _is_split_k, _m_pad)
+        store_c = StoreC(A_scale, B_scale, C_workspace if _is_split_k else C, M, N, mfma.idx, N_TILES_A, N_TILES_B, _is_split_k, _m_pad)
 
         # Prologue: 8-buffer LDS pipeline pre-fill.
         a_g2s.load(a_cur0, A0_gl_offset + 0 * A_K_STEP)
@@ -443,6 +444,7 @@ def compile_fp8_gemm_4w(
         A: fx.Tensor,
         B_T: fx.Tensor,
         C: fx.Tensor,
+        C_workspace: fx.Tensor,
         A_scale: fx.Tensor,
         B_scale: fx.Tensor,
         stream: fx.Stream,
@@ -472,28 +474,42 @@ def compile_fp8_gemm_4w(
             A,
             B_T,
             C,
+            C_workspace,
             A_scale,
             B_scale,
             value_attrs={"rocdl.waves_per_eu": 1, "rocdl.flat_work_group_size": "256,256"},
-        ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
+        ).launch(grid=(grid_x, n_splits, 1), block=(256, 1, 1), stream=stream)
 
     if not _is_split_k:
         return launch_gemm, None
 
 
+    REDUCE_BLOCK = 256
+    REDUCE_VEC = 4
+    REDUCE_ELEMS_PER_BLOCK = REDUCE_BLOCK * REDUCE_VEC
+
     @flyc.kernel
     def reduce_kernel(C_ws: fx.Tensor, C: fx.Tensor):
-        split_k = SplitK(C_ws, C, M, N, _m_pad, n_splits)
-        split_k.reduce()
+        c_ws_rsrc = buffer_ops.create_buffer_resource(
+            C_ws, max_size=False, num_records_bytes=n_splits * (_m_pad * N * 4)
+        )
+        c_rsrc = buffer_ops.create_buffer_resource(C, max_size=False, num_records_bytes=M * N * 2)
 
+        base_idx = fx.block_idx.x * REDUCE_ELEMS_PER_BLOCK + fx.thread_idx.x * REDUCE_VEC
+        total_elems = M * N
+        if base_idx < total_elems:
+            acc = Vec(buffer_ops.buffer_load(c_ws_rsrc, fx.Int32(base_idx), vec_width=4, dtype=fx.Float32))
+            for s in range_constexpr(n_splits - 1):
+                ws_offset = (s + 1) * _m_pad * N + base_idx
+                val = Vec(buffer_ops.buffer_load(c_ws_rsrc, fx.Int32(ws_offset), vec_width=4, dtype=fx.Float32))
+                acc = acc + val
+            buffer_ops.buffer_store(acc.to(fx.BFloat16), c_rsrc, fx.Int32(base_idx))
 
     @flyc.jit
     def launch_reduce(C_ws: fx.Tensor, C: fx.Tensor, stream: fx.Stream):
         total_elems = M * N
-        reduce_kernel(
-            C_ws, C
-        ).launch(grid=(ceildiv(total_elems, SplitK._REDUCE_ELEMS_PER_BLOCK), 1, 1),
-                 block=(SplitK._REDUCE_BLOCK, 1, 1), stream=stream)
+        grid_x = ceildiv(total_elems, REDUCE_ELEMS_PER_BLOCK)
+        reduce_kernel(C_ws, C).launch(grid=(grid_x, 1, 1), block=(REDUCE_BLOCK, 1, 1), stream=stream)
 
     return launch_gemm, launch_reduce
 
