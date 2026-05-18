@@ -22,7 +22,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 
-from tests.kernels.gemm_tuning_utils import FlyGemmConfig, bench_gemm, bench_torch_scaled_mm
+from tests.kernels.gemm_tuning_utils import FlyGemmConfig, bench_gemm, bench_preshuffle_gemm, bench_torch_scaled_mm
 
 CSV_URL = (
     "https://raw.githubusercontent.com/ROCm/aiter/main/"
@@ -76,6 +76,22 @@ def extract_tile(kernel_name: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _parse_flydsl_kernel_name(kernel_name: str) -> tuple[int, ...] | None:
+    """Parse tile config from flydsl kernelName.
+
+    Returns ``(tile_m, tile_n, tile_k, lds_stage, cshuffle, async_copy,
+    waves_per_eu, xcd_swizzle)`` or None on parse failure.
+    """
+    m = re.match(
+        r"flydsl_bpreshuflle_(\d+)x(\d+)x(\d+)_\w+_\w+_\w+_"
+        r"(\d+)x(\d+)x(\d+)x(\d+)x(\d+)",
+        kernel_name,
+    )
+    if m is None:
+        return None
+    return tuple(int(m.group(i)) for i in range(1, 9))
+
+
 def parse_entries(rows: list[dict]) -> list[dict]:
     entries = []
     for r in rows:
@@ -83,7 +99,8 @@ def parse_entries(rows: list[dict]) -> list[dict]:
         tflops = float(r["tflops"])
         tile = extract_tile(r.get("kernelName", ""))
         tile_parts = [int(v) for v in tile.split("x")] if tile else []
-        entries.append({
+        parsed = _parse_flydsl_kernel_name(r.get("kernelName", ""))
+        entry = {
             "M": m, "N": n, "K": k,
             "shape": f"{m}x{n}x{k}",
             "tile": tile or "?",
@@ -91,7 +108,17 @@ def parse_entries(rows: list[dict]) -> list[dict]:
             "tile_N": tile_parts[1] if len(tile_parts) > 1 else None,
             "tile_K": tile_parts[2] if len(tile_parts) > 2 else None,
             "tflops": tflops,
-        })
+        }
+        if parsed:
+            entry["parsed_tile_m"] = parsed[0]
+            entry["parsed_tile_n"] = parsed[1]
+            entry["parsed_tile_k"] = parsed[2]
+            entry["parsed_lds_stage"] = parsed[3]
+            entry["parsed_cshuffle"] = parsed[4]
+            entry["parsed_async_copy"] = parsed[5]
+            entry["parsed_waves_per_eu"] = parsed[6]
+            entry["parsed_xcd_swizzle"] = parsed[7]
+        entries.append(entry)
     entries.sort(key=lambda e: (e["M"], e["N"], e["K"]))
     return entries
 
@@ -112,19 +139,88 @@ def _fmt_config(cfg: FlyGemmConfig) -> str:
     return s
 
 
-def run_benchmarks(baseline: list[dict]) -> dict[str, list[dict]]:
+_CSV_FIELDS = [
+    "M", "N", "K", "provider", "tflops",
+    "tile_m", "tile_n", "tile_k",
+    "num_waves", "num_split",
+    "lds_stage", "cshuffle", "async_copy", "waves_per_eu", "xcd_swizzle",
+]
+
+
+def _init_csv(csv_path: str):
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_CSV_FIELDS)
+        writer.writeheader()
+
+
+def _append_csv_row(csv_path: str, row: dict):
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_CSV_FIELDS)
+        writer.writerow(row)
+
+
+def _empty_csv_row(m, n, k, provider, tflops):
+    return {f: "" for f in _CSV_FIELDS} | {
+        "M": m, "N": n, "K": k, "provider": provider, "tflops": f"{tflops:.2f}",
+    }
+
+
+def run_benchmarks(baseline: list[dict], csv_path: str | None = None) -> dict[str, list[dict]]:
+    if csv_path:
+        _init_csv(csv_path)
+
+    preshuffle_results = []
     flydsl_results = []
     torch_results = []
 
     for entry in baseline:
         shape = entry["shape"]
         m, n, k = entry["M"], entry["N"], entry["K"]
-        base_tf = entry["tflops"]
         print(f"Benchmarking {shape}...")
+
+        has_parsed = "parsed_tile_m" in entry
+        if has_parsed:
+            try:
+                base_tf = bench_preshuffle_gemm(
+                    m, n, k,
+                    tile_m=entry["parsed_tile_m"],
+                    tile_n=entry["parsed_tile_n"],
+                    tile_k=entry["parsed_tile_k"],
+                    lds_stage=entry["parsed_lds_stage"],
+                    use_cshuffle=bool(entry["parsed_cshuffle"]),
+                    use_async_copy=bool(entry["parsed_async_copy"]),
+                    waves_per_eu=entry["parsed_waves_per_eu"],
+                    xcd_swizzle=entry["parsed_xcd_swizzle"],
+                )
+                print(f"FlyDSL (preshuffle_gemm.py) mesured {base_tf:.2f} TFLOPS (CSV value was {entry['tflops']})")
+                preshuffle_results.append({
+                    "M": m, "N": n, "K": k,
+                    "shape": shape,
+                    "tile": f"{entry['parsed_tile_m']}x{entry['parsed_tile_n']}",
+                    "tflops": base_tf,
+                })
+                if csv_path:
+                    _append_csv_row(csv_path, {
+                        "M": m, "N": n, "K": k,
+                        "provider": "FlyDSL (preshuffle_gemm.py)",
+                        "tflops": f"{base_tf:.2f}",
+                        "tile_m": entry["parsed_tile_m"],
+                        "tile_n": entry["parsed_tile_n"],
+                        "tile_k": entry["parsed_tile_k"],
+                        "num_waves": "",
+                        "num_split": "",
+                        "lds_stage": entry["parsed_lds_stage"],
+                        "cshuffle": entry["parsed_cshuffle"],
+                        "async_copy": entry["parsed_async_copy"],
+                        "waves_per_eu": entry["parsed_waves_per_eu"],
+                        "xcd_swizzle": entry["parsed_xcd_swizzle"],
+                    })
+            except Exception as e:
+                print(f"  FlyDSL (preshuffle_gemm.py): SKIP ({e})")
 
         try:
             cfg = bench_gemm(m, n, k)
-            label = f"FlyDSL (best) [{_fmt_config(cfg)}]"
+            label = f"FlyDSL (custom) [{_fmt_config(cfg)}]"
             _print_speedup(label, cfg.tflops, base_tf)
             flydsl_results.append({
                 "M": m, "N": n, "K": k,
@@ -134,8 +230,15 @@ def run_benchmarks(baseline: list[dict]) -> dict[str, list[dict]]:
                 "num_waves": cfg.num_waves,
                 "num_split": cfg.num_split,
             })
+            if csv_path:
+                _append_csv_row(csv_path, _empty_csv_row(m, n, k, "FlyDSL (custom)", cfg.tflops) | {
+                    "tile_m": cfg.tile_m,
+                    "tile_n": cfg.tile_n,
+                    "num_waves": cfg.num_waves,
+                    "num_split": cfg.num_split,
+                })
         except Exception as e:
-            print(f"  FlyDSL (best): SKIP ({e})")
+            print(f"  FlyDSL (custom): SKIP ({e})")
 
         try:
             torch_tf = bench_torch_scaled_mm(m, n, k)
@@ -145,12 +248,16 @@ def run_benchmarks(baseline: list[dict]) -> dict[str, list[dict]]:
                 "shape": shape,
                 "tflops": torch_tf,
             })
+            if csv_path:
+                _append_csv_row(csv_path, _empty_csv_row(m, n, k, "torch.scaled_mm", torch_tf))
         except Exception as e:
             print(f"  torch.scaled_mm: SKIP ({e})")
 
     providers = {}
+    if preshuffle_results:
+        providers["FlyDSL (preshuffle_gemm.py)"] = preshuffle_results
     if flydsl_results:
-        providers["FlyDSL (best)"] = flydsl_results
+        providers["FlyDSL (custom)"] = flydsl_results
     if torch_results:
         providers["torch.scaled_mm"] = torch_results
     return providers
@@ -423,6 +530,28 @@ document.querySelectorAll('#perfTable th, #tileTable th').forEach(th => {{
 </html>"""
 
 
+def load_csv_as_providers(csv_path: str) -> dict[str, list[dict]]:
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+    providers: dict[str, list[dict]] = {}
+    for r in rows:
+        m, n, k = int(r["M"]), int(r["N"]), int(r["K"])
+        entry: dict = {
+            "M": m, "N": n, "K": k,
+            "shape": f"{m}x{n}x{k}",
+            "tflops": float(r["tflops"]),
+        }
+        if r.get("tile_m") and r.get("tile_n"):
+            entry["tile"] = f"{r['tile_m']}x{r['tile_n']}"
+        if r.get("num_waves"):
+            entry["num_waves"] = int(r["num_waves"])
+        if r.get("num_split"):
+            entry["num_split"] = int(r["num_split"])
+        providers.setdefault(r["provider"], []).append(entry)
+    return providers
+
+
 def serve_html(path: str, port: int):
     directory = os.path.dirname(os.path.abspath(path))
     filename = os.path.basename(path)
@@ -444,33 +573,42 @@ if __name__ == "__main__":
     parser.add_argument("--gfx", default=FILTER_GFX, help=f"GPU arch filter (default: {FILTER_GFX})")
     parser.add_argument("--libtype", default=FILTER_LIBTYPE, help=f"Library type filter (default: {FILTER_LIBTYPE})")
     parser.add_argument("--dtype", default=FILTER_DTYPE, help=f"Dtype filter (default: {FILTER_DTYPE})")
-    parser.add_argument("-o", "--output", type=str, default="fp8_v2_ds_shapes.html", help="Output HTML path")
+    parser.add_argument("-o", "--output", type=str, default="fp8_ds_shapes__0518_4pm.html", help="Output HTML path")
+    parser.add_argument("--csv", type=str, default="fp8_ds_shapes__0518_4pm.csv", help="Output CSV path for best configs (written incrementally)")
+    parser.add_argument("--load-csv", type=str, default=None, help="Load results from a previously saved CSV and produce an HTML report (skip benchmarking)")
     parser.add_argument("--serve", action="store_true", help="Start a local HTTP server and open the report in a browser")
     parser.add_argument("--port", type=int, default=8888, help="Port for --serve (default: 8888)")
     args = parser.parse_args()
 
-    print("Downloading baseline CSV from aiter ...")
-    all_rows = download_csv(CSV_URL)
-    print(f"  {len(all_rows)} total rows")
+    if args.load_csv:
+        print(f"Loading results from {args.load_csv} ...")
+        providers = load_csv_as_providers(args.load_csv)
+        total = sum(len(v) for v in providers.values())
+        print(f"  {total} rows across {len(providers)} providers: {', '.join(providers.keys())}")
+    else:
+        print("Downloading baseline CSV from aiter ...")
+        all_rows = download_csv(CSV_URL)
+        print(f"  {len(all_rows)} total rows")
 
-    filtered = filter_rows(all_rows, gfx=args.gfx, libtype=args.libtype, dtype=args.dtype)
-    print(f"  {len(filtered)} rows matching gfx={args.gfx} libtype={args.libtype} dtype={args.dtype}")
+        filtered = filter_rows(all_rows, gfx=args.gfx, libtype=args.libtype, dtype=args.dtype)
+        print(f"  {len(filtered)} rows matching gfx={args.gfx} libtype={args.libtype} dtype={args.dtype}")
 
-    if not filtered:
-        print("\nNo matching rows found. Available filter values:")
-        gfxs = sorted(set(r.get("gfx", "").strip() for r in all_rows))
-        libs = sorted(set(r.get("libtype", "").strip() for r in all_rows))
-        dtypes = sorted(set(r.get("q_dtype_w", "").strip() for r in all_rows))
-        print(f"  gfx:     {', '.join(gfxs)}")
-        print(f"  libtype: {', '.join(libs)}")
-        print(f"  dtype:   {', '.join(dtypes)}")
-        sys.exit(0)
+        if not filtered:
+            print("\nNo matching rows found. Available filter values:")
+            gfxs = sorted(set(r.get("gfx", "").strip() for r in all_rows))
+            libs = sorted(set(r.get("libtype", "").strip() for r in all_rows))
+            dtypes = sorted(set(r.get("q_dtype_w", "").strip() for r in all_rows))
+            print(f"  gfx:     {', '.join(gfxs)}")
+            print(f"  libtype: {', '.join(libs)}")
+            print(f"  dtype:   {', '.join(dtypes)}")
+            sys.exit(0)
 
-    baseline = parse_entries(filtered)
+        baseline = parse_entries(filtered)
 
-    providers = {"Baseline (aiter)": baseline}
-    bench_providers = run_benchmarks(baseline)
-    providers.update(bench_providers)
+        providers = run_benchmarks(baseline, csv_path=args.csv)
+
+        if args.csv:
+            print(f"\nCSV results written to {args.csv}")
 
     html_content = generate_html(providers)
 
