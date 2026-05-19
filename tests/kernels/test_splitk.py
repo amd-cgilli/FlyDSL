@@ -265,7 +265,7 @@ if __name__ == "__main__":
         target_perf = DS_SHAPES_TUNE[s]
         m, n, k = s
         bm, bn = 64, 128
-        stages = 5
+        stages = 4
         # for bm in [64, 128]:
         #     for bn in [64, 128]:
         #         for stages in [2, 3, 4]:

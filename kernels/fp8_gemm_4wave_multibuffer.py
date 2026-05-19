@@ -322,19 +322,20 @@ def compile_fp8_gemm_4w(
 
         # Final K-tile: all data in registers, no more LDS reads needed from later stages.
         wait_barrier(0)
-        b1_frag = b_s2r.load(b_lds[cs][1], preshuffled=b_preshuffled)
-        a1_frag = a_s2r.load(a_lds[cs][1])
-        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
-        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
-        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
-        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
-
         base_row = tile_i * BLOCK_M + wave_i * (N_TILES_A * 16)
         base_col = tile_j * BLOCK_N + wave_j * (N_TILES_B * 16)
         a_scales_0 = store_c.load_a_scales(base_row)
         a_scales_1 = store_c.load_a_scales(base_row + LDS_BLOCK_M)
         b_scales_0 = store_c.load_b_scales(base_col)
         b_scales_1 = store_c.load_b_scales(base_col + LDS_BLOCK_N)
+
+        b1_frag = b_s2r.load(b_lds[cs][1], preshuffled=b_preshuffled)
+        a1_frag = a_s2r.load(a_lds[cs][1])
+
+        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
+        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
+        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
+        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
 
         store_c.store_with_scales(c00_frag, base_row + 0, base_col + 0, a_scales_0, b_scales_0)
         store_c.store_with_scales(c01_frag, base_row + 0, base_col + LDS_BLOCK_N, a_scales_0, b_scales_1)
