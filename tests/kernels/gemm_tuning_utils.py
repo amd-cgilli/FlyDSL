@@ -74,12 +74,11 @@ def _check_gemm(
 
     stream = torch.cuda.current_stream()
 
-    def _gemm_args(c, ws, a, b, sa, sb):
+    def _gemm_args(c, a, b, sa, sb):
         return (
             _as_i8(a).contiguous().view(-1),
             _as_i8(b).contiguous().view(-1),
             c.contiguous().view(-1),
-            ws.contiguous().view(-1),
             sa.contiguous().view(-1),
             sb.contiguous().view(-1),
             stream,
@@ -92,14 +91,18 @@ def _check_gemm(
             stream,
         )
 
-    compiled_gemm = flyc.compile(launch_gemm_fn, *_gemm_args(c_out_raw, c_workspace, a_q, b_q, scale_a, scale_b))
     if IS_SPLIT_K:
+        compiled_gemm = flyc.compile(launch_gemm_fn, *_gemm_args(c_workspace, a_q, b_q, scale_a, scale_b))
         compiled_reduce = flyc.compile(launch_reduce_fn, *_reduce_args(c_workspace, c_out_raw))
+    else:
+        compiled_gemm = flyc.compile(launch_gemm_fn, *_gemm_args(c_out_raw, a_q, b_q, scale_a, scale_b))
 
     def _launch(c, ws, a, b, sa, sb):
-        compiled_gemm(*_gemm_args(c, ws, a, b, sa, sb))
         if IS_SPLIT_K:
+            compiled_gemm(*_gemm_args(ws, a, b, sa, sb))
             compiled_reduce(*_reduce_args(ws, c))
+        else:
+            compiled_gemm(*_gemm_args(c, a, b, sa, sb))
 
     num_iters = max(2, int(num_iters))
 
@@ -157,12 +160,16 @@ def _list_available_configs(M: int, N: int, K: int, num_waves: int) -> list[FlyG
     valid_bn = _KERNEL_CONFIGS[num_waves]["valid_bn"]
     compile_fn = _KERNEL_CONFIGS[num_waves]["fn"]
 
+    min_bm = valid_bm[0]
     for bm in valid_bm:
+        if M < min_bm and bm > min_bm:
+            continue
         for bn in valid_bn:
             for s in splits:
                 # Heuristic: if the number of thread blocks is a multiple of the number of CUs in the chip skip split-k
-                n_blocks = ((M - bm + 1) // bm) * ((N - bn + 1) // bn)
-                if n_blocks % 256 == 0 and s != 1:
+                n_blocks = ((M + bm - 1) // bm) * ((N + bn - 1) // bn)
+                rem = n_blocks % 256
+                if (rem == 0 or rem / 256 > 0.51) and s != 1:
                     continue
                 print(f'[{num_waves}w] testing tile_m={bm} tile_n={bn} splits={s}...', end='')
                 try:
@@ -188,8 +195,8 @@ def _list_available_configs(M: int, N: int, K: int, num_waves: int) -> list[FlyG
 
 def bench_gemm(M: int, N: int, K: int) -> FlyGemmConfig:
     all_configs = _list_available_configs(M, N, K, 4)
-    if M > 1024:
-        all_configs.extend(_list_available_configs(M, N, K, 8))
+    # if M > 1024:
+    all_configs.extend(_list_available_configs(M, N, K, 8))
 
     if not all_configs:
         raise ValueError(f"No valid GEMM config found for M={M}, N={N}, K={K}")

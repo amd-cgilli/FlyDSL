@@ -21,7 +21,7 @@ from kernels.fp8_gemm_utils import (
     ceildiv,
     compute_global_swizzle,
     make_fp8_buffer_tensor,
-    wait_barrier,
+    wait_barrier
 )
 
 
@@ -95,7 +95,6 @@ def compile_fp8_gemm_8w(
         A: fx.Tensor,
         B_T: fx.Tensor,
         C: fx.Tensor,
-        C_workspace: fx.Tensor,
         A_scale: fx.Tensor,
         B_scale: fx.Tensor,
     ):
@@ -141,7 +140,7 @@ def compile_fp8_gemm_8w(
         b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
         a_s2r = S2RLoader(wave_m, N_TILES_A)
         b_s2r = S2RLoader(wave_n, N_TILES_B)
-        store_c = StoreC(A_scale, B_scale, C_workspace if _is_split_k else C, M, N, mfma.idx, N_TILES_A, N_TILES_B, _is_split_k, _m_pad)
+        store_c = StoreC(A_scale, B_scale, C, M, N, mfma.idx, N_TILES_A, N_TILES_B, _is_split_k, _m_pad)
 
         # 2x2 config of 4x2 (instead of 4x4 in 4wave) 16x16 sub-tiles
         c00_frag = [mfma.zero_value] * N_ACCUMS
@@ -154,8 +153,8 @@ def compile_fp8_gemm_8w(
         b_g2s.load(b_cur1, B1_gl_offset + 0 * B_K_STEP)
         a_g2s.load(a_cur1, A1_gl_offset + 0 * BLOCK_K)
 
-        if wave_m == 1:
-            rocdl.s_barrier()
+        # if wave_m == 1:
+        #     rocdl.s_barrier()
 
         wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
 
@@ -169,30 +168,30 @@ def compile_fp8_gemm_8w(
             b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
             a0_frag = a_s2r.load(a_cur0)
             a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
-            rocdl.s_barrier()
+            # rocdl.s_barrier()
 
             rocdl.s_setprio(1)
             c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
             rocdl.s_setprio(0)
-            rocdl.s_barrier()
+            # rocdl.s_barrier()
 
             b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
             b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * B_K_STEP)
-            rocdl.s_barrier()
+            # rocdl.s_barrier()
 
             rocdl.s_setprio(1)
             c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
             rocdl.s_setprio(0)
-            rocdl.s_barrier()
+            # rocdl.s_barrier()
 
             a1_frag = a_s2r.load(a_cur1)
             a_g2s.load(a_cur0, A0_gl_offset + (k + 2) * BLOCK_K)
-            rocdl.s_barrier()
+            # rocdl.s_barrier()
 
             rocdl.s_setprio(1)
             c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
             rocdl.s_setprio(0)
-            rocdl.s_barrier()
+            # rocdl.s_barrier()
 
             b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * B_K_STEP)
             wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
@@ -200,7 +199,7 @@ def compile_fp8_gemm_8w(
             rocdl.s_setprio(1)
             c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
             rocdl.s_setprio(0)
-            rocdl.s_barrier()
+            # rocdl.s_barrier()
 
             # Swap cur and next
             a_cur0, a_next0 = a_next0, a_cur0
@@ -212,36 +211,36 @@ def compile_fp8_gemm_8w(
         k = K_ITERS - 2
         b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
         a0_frag = a_s2r.load(a_cur0)
-        rocdl.s_barrier()
+        # rocdl.s_barrier()
 
         rocdl.s_setprio(1)
         c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
         rocdl.s_setprio(0)
-        rocdl.s_barrier()
+        # rocdl.s_barrier()
 
         b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
-        rocdl.s_barrier()
+        # rocdl.s_barrier()
 
         rocdl.s_setprio(1)
         c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
         rocdl.s_setprio(0)
-        rocdl.s_barrier()
+        # rocdl.s_barrier()
 
         a1_frag = a_s2r.load(a_cur1)
-        rocdl.s_barrier()
+        # rocdl.s_barrier()
 
         rocdl.s_setprio(1)
         c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
         rocdl.s_setprio(0)
-        rocdl.s_barrier()
+        # rocdl.s_barrier()
 
         b0_frag = b_s2r.load(b_next0, preshuffled=b_preshuffled)
-        rocdl.s_barrier()
+        # rocdl.s_barrier()
 
         rocdl.s_setprio(1)
         c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
         rocdl.s_setprio(0)
-        rocdl.s_barrier()
+        # rocdl.s_barrier()
         # Swap cur and next
         a_cur0, a_next0 = a_next0, a_cur0
         a_cur1, a_next1 = a_next1, a_cur1
@@ -256,24 +255,24 @@ def compile_fp8_gemm_8w(
         rocdl.s_setprio(1)
         c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
         rocdl.s_setprio(0)
-        rocdl.s_barrier()
+        # rocdl.s_barrier()
 
         b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
-        rocdl.s_barrier()
+        # rocdl.s_barrier()
 
         rocdl.s_setprio(1)
         c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
         rocdl.s_setprio(0)
-        rocdl.s_barrier()
+        # rocdl.s_barrier()
 
         a1_frag = a_s2r.load(a_cur1)
-        rocdl.s_barrier()
+        # rocdl.s_barrier()
 
         rocdl.s_setprio(1)
         c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
         c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
         rocdl.s_setprio(0)
-        rocdl.s_barrier()
+        # rocdl.s_barrier()
 
         # Scale and store back to gmem
         wave_n_offset = wave_n * (N_TILES_B * 16)
@@ -281,17 +280,21 @@ def compile_fp8_gemm_8w(
         base_row = block_m * BLOCK_M + wave_m_offset
         base_col = block_n * BLOCK_N + wave_n_offset
 
-        store_c.store(c00_frag, base_row + 0, base_col + 0)
-        store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
-        store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
-        store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
+        a_scales_0 = store_c.load_a_scales(base_row)
+        a_scales_1 = store_c.load_a_scales(base_row + LDS_BLOCK_M)
+        b_scales_0 = store_c.load_b_scales(base_col)
+        b_scales_1 = store_c.load_b_scales(base_col + LDS_BLOCK_N)
+
+        store_c.store_with_scales(c00_frag, base_row + 0, base_col + 0, a_scales_0, b_scales_0)
+        store_c.store_with_scales(c01_frag, base_row + 0, base_col + LDS_BLOCK_N, a_scales_0, b_scales_1)
+        store_c.store_with_scales(c10_frag, base_row + LDS_BLOCK_M, base_col + 0, a_scales_1, b_scales_0)
+        store_c.store_with_scales(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N, a_scales_1, b_scales_1)
 
     @flyc.jit
     def launch_gemm(
         A: fx.Tensor,
         B_T: fx.Tensor,
         C: fx.Tensor,
-        C_workspace: fx.Tensor,
         A_scale: fx.Tensor,
         B_scale: fx.Tensor,
         stream: fx.Stream,
@@ -321,7 +324,6 @@ def compile_fp8_gemm_8w(
             A,
             B_T,
             C,
-            C_workspace,
             A_scale,
             B_scale,
             value_attrs={"rocdl.waves_per_eu": 2, "rocdl.flat_work_group_size": "512,512"},

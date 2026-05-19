@@ -140,7 +140,7 @@ def compile_fp8_gemm_4w(
         A: fx.Tensor,
         B_T: fx.Tensor,
         C: fx.Tensor,
-        C_workspace: fx.Tensor,
+        # C_workspace: fx.Tensor,
         A_scale: fx.Tensor,
         B_scale: fx.Tensor,
     ):
@@ -329,7 +329,7 @@ def compile_fp8_gemm_4w(
         b_g2s = G2SLoader(gb_div, gl_off_b, N_TILES_B, F8_IR_t, wave_id)
         a_s2r = S2RLoader(wave_i, N_TILES_A)
         b_s2r = S2RLoader(wave_j, N_TILES_B)
-        store_c = StoreC(A_scale, B_scale, C_workspace if _is_split_k else C, M, N, mfma.idx, N_TILES_A, N_TILES_B, _is_split_k, _m_pad)
+        store_c = StoreC(A_scale, B_scale, C, M, N, mfma.idx, N_TILES_A, N_TILES_B, _is_split_k, _m_pad)
 
         # Prologue: 8-buffer LDS pipeline pre-fill.
         a_g2s.load(a_cur0, A0_gl_offset + 0 * A_K_STEP)
@@ -343,7 +343,6 @@ def compile_fp8_gemm_4w(
         a_g2s.load(a_next1, A1_gl_offset + 1 * A_K_STEP)
 
         wait_barrier((3 * N_TILES_A) + (4 * N_TILES_B))
-
         a0_frag = a_s2r.load(a_cur0)
 
         wait_barrier((3 * N_TILES_A) + (3 * N_TILES_B))
@@ -434,17 +433,22 @@ def compile_fp8_gemm_4w(
         c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
         c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
 
-        store_c.store(c00_frag, base_row + 0, base_col + 0)
-        store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
-        store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
-        store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
+        a_scales_0 = store_c.load_a_scales(base_row)
+        a_scales_1 = store_c.load_a_scales(base_row + LDS_BLOCK_M)
+        b_scales_0 = store_c.load_b_scales(base_col)
+        b_scales_1 = store_c.load_b_scales(base_col + LDS_BLOCK_N)
+
+        store_c.store_with_scales(c00_frag, base_row + 0, base_col + 0, a_scales_0, b_scales_0)
+        store_c.store_with_scales(c01_frag, base_row + 0, base_col + LDS_BLOCK_N, a_scales_0, b_scales_1)
+        store_c.store_with_scales(c10_frag, base_row + LDS_BLOCK_M, base_col + 0, a_scales_1, b_scales_0)
+        store_c.store_with_scales(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N, a_scales_1, b_scales_1)
 
     @flyc.jit
     def launch_gemm(
         A: fx.Tensor,
         B_T: fx.Tensor,
         C: fx.Tensor,
-        C_workspace: fx.Tensor,
+        # C_workspace: fx.Tensor,
         A_scale: fx.Tensor,
         B_scale: fx.Tensor,
         stream: fx.Stream,
@@ -474,7 +478,7 @@ def compile_fp8_gemm_4w(
             A,
             B_T,
             C,
-            C_workspace,
+            # C_workspace,
             A_scale,
             B_scale,
             value_attrs={"rocdl.waves_per_eu": 1, "rocdl.flat_work_group_size": "256,256"},

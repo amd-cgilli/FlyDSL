@@ -162,13 +162,24 @@ class StoreC:
         fx.memref_store_vec(Vec.filled(1, val, dtype), reg_t)
         fx.copy(self.out_atom, reg_t, fx.slice(self.c_div, (None, fx.Int32(c_index))))
 
+    def load_a_scales(self, base_row):
+        return [
+            self._load_scale_vec4(base_row + i * 16 + (self.lane_id // 16) * 4)
+            for i in range_constexpr(self.n_tiles_a)
+        ]
+
+    def load_b_scales(self, base_col):
+        return [
+            self._load_scale_scalar(base_col + i * 16 + self.lane_id % 16)
+            for i in range_constexpr(self.n_tiles_b)
+        ]
+
     def store(self, c_frag, base_row, base_col):
-        a_scales = [
-            self._load_scale_vec4(base_row + i * 16 + (self.lane_id // 16) * 4) for i in range_constexpr(self.n_tiles_a)
-        ]
-        b_scales = [
-            self._load_scale_scalar(base_col + i * 16 + self.lane_id % 16) for i in range_constexpr(self.n_tiles_b)
-        ]
+        a_scales = self.load_a_scales(base_row)
+        b_scales = self.load_b_scales(base_col)
+        self.store_with_scales(c_frag, base_row, base_col, a_scales, b_scales)
+
+    def store_with_scales(self, c_frag, base_row, base_col, a_scales, b_scales):
         for ti in range_constexpr(self.n_tiles_a):
             row = base_row + ti * 16 + (self.lane_id // 16) * 4
             for tj in range_constexpr(self.n_tiles_b):
@@ -190,7 +201,8 @@ def wait_barrier(count):
     _llvm.inline_asm(
         res=None,
         operands_=[],
-        asm_string=f"s_waitcnt vmcnt({count})\ns_barrier",
+        asm_string=f"s_waitcnt vmcnt({count})",
+        # asm_string=f"s_waitcnt vmcnt({count})\ns_barrier",
         constraints="",
         has_side_effects=True,
     )

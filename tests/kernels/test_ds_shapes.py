@@ -175,48 +175,72 @@ def run_benchmarks(baseline: list[dict], csv_path: str | None = None) -> dict[st
 
     for entry in baseline:
         shape = entry["shape"]
+        base_tf = entry['tflops']
         m, n, k = entry["M"], entry["N"], entry["K"]
         print(f"Benchmarking {shape}...")
 
-        has_parsed = "parsed_tile_m" in entry
-        if has_parsed:
-            try:
-                base_tf = bench_preshuffle_gemm(
-                    m, n, k,
-                    tile_m=entry["parsed_tile_m"],
-                    tile_n=entry["parsed_tile_n"],
-                    tile_k=entry["parsed_tile_k"],
-                    lds_stage=entry["parsed_lds_stage"],
-                    use_cshuffle=bool(entry["parsed_cshuffle"]),
-                    use_async_copy=bool(entry["parsed_async_copy"]),
-                    waves_per_eu=entry["parsed_waves_per_eu"],
-                    xcd_swizzle=entry["parsed_xcd_swizzle"],
-                )
-                print(f"FlyDSL (preshuffle_gemm.py) mesured {base_tf:.2f} TFLOPS (CSV value was {entry['tflops']})")
-                preshuffle_results.append({
-                    "M": m, "N": n, "K": k,
-                    "shape": shape,
-                    "tile": f"{entry['parsed_tile_m']}x{entry['parsed_tile_n']}",
-                    "tflops": base_tf,
-                })
-                if csv_path:
-                    _append_csv_row(csv_path, {
-                        "M": m, "N": n, "K": k,
-                        "provider": "FlyDSL (preshuffle_gemm.py)",
-                        "tflops": f"{base_tf:.2f}",
-                        "tile_m": entry["parsed_tile_m"],
-                        "tile_n": entry["parsed_tile_n"],
-                        "tile_k": entry["parsed_tile_k"],
-                        "num_waves": "",
-                        "num_split": "",
-                        "lds_stage": entry["parsed_lds_stage"],
-                        "cshuffle": entry["parsed_cshuffle"],
-                        "async_copy": entry["parsed_async_copy"],
-                        "waves_per_eu": entry["parsed_waves_per_eu"],
-                        "xcd_swizzle": entry["parsed_xcd_swizzle"],
-                    })
-            except Exception as e:
-                print(f"  FlyDSL (preshuffle_gemm.py): SKIP ({e})")
+        preshuffle_results.append({
+            "M": m, "N": n, "K": k,
+            "shape": shape,
+            "tflops": base_tf,
+            "tile": f"{entry['parsed_tile_m']}x{entry['parsed_tile_n']}x{entry['parsed_tile_k']}",
+        })
+        if csv_path:
+            _append_csv_row(csv_path, {
+                "M": m, "N": n, "K": k,
+                "provider": "FlyDSL (preshuffle_gemm.py)",
+                "tflops": f"{base_tf:.2f}",
+                "tile_m": entry["parsed_tile_m"],
+                "tile_n": entry["parsed_tile_n"],
+                "tile_k": entry["parsed_tile_k"],
+                "num_waves": "",
+                "num_split": "",
+                "lds_stage": entry["parsed_lds_stage"],
+                "cshuffle": entry["parsed_cshuffle"],
+                "async_copy": entry["parsed_async_copy"],
+                "waves_per_eu": entry["parsed_waves_per_eu"],
+                "xcd_swizzle": entry["parsed_xcd_swizzle"],
+            })
+        print(f"FlyDSL (preshuffle_gemm.py) reported perf: {base_tf:.2f} TFLOPS")
+        # has_parsed = "parsed_tile_m" in entry
+        # if has_parsed:
+        #     try:
+        #         base_tf = bench_preshuffle_gemm(
+        #             m, n, k,
+        #             tile_m=entry["parsed_tile_m"],
+        #             tile_n=entry["parsed_tile_n"],
+        #             tile_k=entry["parsed_tile_k"],
+        #             lds_stage=entry["parsed_lds_stage"],
+        #             use_cshuffle=bool(entry["parsed_cshuffle"]),
+        #             use_async_copy=bool(entry["parsed_async_copy"]),
+        #             waves_per_eu=entry["parsed_waves_per_eu"],
+        #             xcd_swizzle=entry["parsed_xcd_swizzle"],
+        #         )
+        #         print(f"FlyDSL (preshuffle_gemm.py) mesured {base_tf:.2f} TFLOPS (CSV value was {entry['tflops']})")
+        #         preshuffle_results.append({
+        #             "M": m, "N": n, "K": k,
+        #             "shape": shape,
+        #             "tile": f"{entry['parsed_tile_m']}x{entry['parsed_tile_n']}",
+        #             "tflops": base_tf,
+        #         })
+        #         if csv_path:
+        #             _append_csv_row(csv_path, {
+        #                 "M": m, "N": n, "K": k,
+        #                 "provider": "FlyDSL (preshuffle_gemm.py)",
+        #                 "tflops": f"{base_tf:.2f}",
+        #                 "tile_m": entry["parsed_tile_m"],
+        #                 "tile_n": entry["parsed_tile_n"],
+        #                 "tile_k": entry["parsed_tile_k"],
+        #                 "num_waves": "",
+        #                 "num_split": "",
+        #                 "lds_stage": entry["parsed_lds_stage"],
+        #                 "cshuffle": entry["parsed_cshuffle"],
+        #                 "async_copy": entry["parsed_async_copy"],
+        #                 "waves_per_eu": entry["parsed_waves_per_eu"],
+        #                 "xcd_swizzle": entry["parsed_xcd_swizzle"],
+        #             })
+        #     except Exception as e:
+        #         print(f"  FlyDSL (preshuffle_gemm.py): SKIP ({e})")
 
         try:
             cfg = bench_gemm(m, n, k)
@@ -300,6 +324,12 @@ def generate_html(providers: dict[str, list[dict]]) -> str:
     for name in names[1:]:
         perf_header += f"<th data-col='{perf_col}' data-type='num'>{html_mod.escape(name)} vs {html_mod.escape(ref_name)}</th>"
         perf_col += 1
+    custom_name = "FlyDSL (custom)"
+    torch_name = "torch.scaled_mm"
+    has_custom_vs_torch = custom_name in names and torch_name in names
+    if has_custom_vs_torch:
+        perf_header += f"<th data-col='{perf_col}' data-type='num'>{html_mod.escape(custom_name)} vs {html_mod.escape(torch_name)}</th>"
+        perf_col += 1
 
     perf_rows = []
     for shape in all_shapes:
@@ -317,12 +347,21 @@ def generate_html(providers: dict[str, list[dict]]) -> str:
                 row += f"<td class='num {cls}'>{sp:.2f}x</td>"
             else:
                 row += "<td class='num'>—</td>"
+        if has_custom_vs_torch:
+            custom_tf = data.get(custom_name, {}).get("tflops")
+            torch_tf = data.get(torch_name, {}).get("tflops")
+            if custom_tf is not None and torch_tf is not None and torch_tf > 0:
+                sp = custom_tf / torch_tf
+                cls = "win" if sp >= 1.0 else "loss"
+                row += f"<td class='num {cls}'>{sp:.2f}x</td>"
+            else:
+                row += "<td class='num'>—</td>"
         perf_rows.append(f"<tr>{row}</tr>")
 
     # --- Tile config table (Shape | Tile + Waves + Split-K + TFLOPS per provider) ---
     tile_names = [n for n in names if any(e.get("tile") for e in providers[n])]
-    has_waves = any(e.get("num_waves") is not None for es in providers.values() for e in es)
-    has_split = any(e.get("num_split") is not None and e.get("num_split", 1) > 1 for es in providers.values() for e in es)
+    provider_has_waves = {n: any(e.get("num_waves") is not None for e in providers[n]) for n in tile_names}
+    provider_has_split = {n: any(e.get("num_split") is not None and e.get("num_split", 1) > 1 for e in providers[n]) for n in tile_names}
 
     tile_header = ""
     tile_rows_html = ""
@@ -333,10 +372,10 @@ def generate_html(providers: dict[str, list[dict]]) -> str:
         for name in tile_names:
             tile_header += f"<th data-col='{tc}' data-type='str'>{html_mod.escape(name)} Tile</th>"
             tc += 1
-            if has_waves:
+            if provider_has_waves[name]:
                 tile_header += f"<th data-col='{tc}' data-type='num'>Waves</th>"
                 tc += 1
-            if has_split:
+            if provider_has_split[name]:
                 tile_header += f"<th data-col='{tc}' data-type='num'>Split-K</th>"
                 tc += 1
             tile_header += f"<th data-col='{tc}' data-type='num'>TFLOPS</th>"
@@ -356,9 +395,9 @@ def generate_html(providers: dict[str, list[dict]]) -> str:
                 nw = e.get("num_waves")
                 ns = e.get("num_split")
                 row += f"<td>{html_mod.escape(tile)}</td>" if tile else "<td>—</td>"
-                if has_waves:
+                if provider_has_waves[name]:
                     row += f"<td class='num'>{nw}</td>" if nw is not None else "<td class='num'>—</td>"
-                if has_split:
+                if provider_has_split[name]:
                     row += f"<td class='num'>{ns}</td>" if ns is not None else "<td class='num'>—</td>"
                 row += f"<td class='num'>{tf:.2f}</td>" if tf is not None else "<td class='num'>—</td>"
             t_rows.append(f"<tr>{row}</tr>")
@@ -573,8 +612,8 @@ if __name__ == "__main__":
     parser.add_argument("--gfx", default=FILTER_GFX, help=f"GPU arch filter (default: {FILTER_GFX})")
     parser.add_argument("--libtype", default=FILTER_LIBTYPE, help=f"Library type filter (default: {FILTER_LIBTYPE})")
     parser.add_argument("--dtype", default=FILTER_DTYPE, help=f"Dtype filter (default: {FILTER_DTYPE})")
-    parser.add_argument("-o", "--output", type=str, default="fp8_ds_shapes__0518_4pm.html", help="Output HTML path")
-    parser.add_argument("--csv", type=str, default="fp8_ds_shapes__0518_4pm.csv", help="Output CSV path for best configs (written incrementally)")
+    parser.add_argument("-o", "--output", type=str, default="fp8_ds_shapes__0519_3pm.html", help="Output HTML path")
+    parser.add_argument("--csv", type=str, default="fp8_ds_shapes__0519_3pm.csv", help="Output CSV path for best configs (written incrementally)")
     parser.add_argument("--load-csv", type=str, default=None, help="Load results from a previously saved CSV and produce an HTML report (skip benchmarking)")
     parser.add_argument("--serve", action="store_true", help="Start a local HTTP server and open the report in a browser")
     parser.add_argument("--port", type=int, default=8888, help="Port for --serve (default: 8888)")
