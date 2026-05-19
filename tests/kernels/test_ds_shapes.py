@@ -202,45 +202,6 @@ def run_benchmarks(baseline: list[dict], csv_path: str | None = None) -> dict[st
                 "xcd_swizzle": entry["parsed_xcd_swizzle"],
             })
         print(f"FlyDSL (preshuffle_gemm.py) reported perf: {base_tf:.2f} TFLOPS")
-        # has_parsed = "parsed_tile_m" in entry
-        # if has_parsed:
-        #     try:
-        #         base_tf = bench_preshuffle_gemm(
-        #             m, n, k,
-        #             tile_m=entry["parsed_tile_m"],
-        #             tile_n=entry["parsed_tile_n"],
-        #             tile_k=entry["parsed_tile_k"],
-        #             lds_stage=entry["parsed_lds_stage"],
-        #             use_cshuffle=bool(entry["parsed_cshuffle"]),
-        #             use_async_copy=bool(entry["parsed_async_copy"]),
-        #             waves_per_eu=entry["parsed_waves_per_eu"],
-        #             xcd_swizzle=entry["parsed_xcd_swizzle"],
-        #         )
-        #         print(f"FlyDSL (preshuffle_gemm.py) mesured {base_tf:.2f} TFLOPS (CSV value was {entry['tflops']})")
-        #         preshuffle_results.append({
-        #             "M": m, "N": n, "K": k,
-        #             "shape": shape,
-        #             "tile": f"{entry['parsed_tile_m']}x{entry['parsed_tile_n']}",
-        #             "tflops": base_tf,
-        #         })
-        #         if csv_path:
-        #             _append_csv_row(csv_path, {
-        #                 "M": m, "N": n, "K": k,
-        #                 "provider": "FlyDSL (preshuffle_gemm.py)",
-        #                 "tflops": f"{base_tf:.2f}",
-        #                 "tile_m": entry["parsed_tile_m"],
-        #                 "tile_n": entry["parsed_tile_n"],
-        #                 "tile_k": entry["parsed_tile_k"],
-        #                 "num_waves": "",
-        #                 "num_split": "",
-        #                 "lds_stage": entry["parsed_lds_stage"],
-        #                 "cshuffle": entry["parsed_cshuffle"],
-        #                 "async_copy": entry["parsed_async_copy"],
-        #                 "waves_per_eu": entry["parsed_waves_per_eu"],
-        #                 "xcd_swizzle": entry["parsed_xcd_swizzle"],
-        #             })
-        #     except Exception as e:
-        #         print(f"  FlyDSL (preshuffle_gemm.py): SKIP ({e})")
 
         try:
             cfg = bench_gemm(m, n, k)
