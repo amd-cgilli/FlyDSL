@@ -11,8 +11,9 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from flydsl.runtime.device import get_rocm_arch
-from kernels.fp8_gemm_4wave import compile_fp8_gemm_4w
+from kernels.fp8_gemm_4wave_multibuffer import compile_fp8_gemm_4w
 from kernels.fp8_gemm_8wave import compile_fp8_gemm_8w
+from tests.kernels.gemm_tuning_utils import bench_gemm
 from tests.test_common import run_perftest, verify_output
 from tests.utils import pertoken_quant
 
@@ -44,6 +45,7 @@ def test_fp8_gemm_4wave(
     *,
     num_splits: int = 1,
     disable_xcd_remap: bool = False,
+    num_lds_stages: int = 2,
     num_warmups: int = 2,
     num_iters: int = 10,
 ):
@@ -73,7 +75,8 @@ def test_fp8_gemm_4wave(
         BLOCK_M=tile_m,
         BLOCK_N=tile_n,
         n_splits=num_splits,
-        use_xcd_remap=not disable_xcd_remap)
+        use_xcd_remap=not disable_xcd_remap,
+        num_lds_stages=num_lds_stages)
     # print(f"✓ Kernel prepared (M={M} N={N} K={K} BLOCK_M={tile_m} BLOCK_N={tile_n} "
     #       f"NUM_SPLITS={num_splits} disable_xcd_remap={disable_xcd_remap})")
 
@@ -230,24 +233,19 @@ def test_fp8_gemm_8wave(
     return flops / (us / 1e6) / 1e12
 
 
-# DS_SMALL_SHAPES_4W = [
-#     (1, 256, 7168),
-#     (1, 2112, 7168),
-#     (1, 3072, 1536),
-#     (1, 4096, 512),
-#     (1, 6144, 1536),
-#     (1, 7168, 4096),
-# ]
-
-DS_SHAPES_8W = {
-    (1, 256, 7168): 0.54,
-    (16384, 8192, 512): 1207.11,
-    (20480, 3072, 1536): 1824.61,
-    (20480, 4096, 512): 1189.5,
-    (32768, 3072, 1536): 1901.37,
-    (32768, 4096, 512): 1225.25,
-    (96, 3072, 1536): 172.18,
-    (32768, 7168, 2048): 2178.01
+DS_SHAPES_TUNE = {
+    # (1, 256, 7168): 0.54,
+    # (16384, 8192, 512): 1207.11,
+    # (20480, 3072, 1536): 1824.61,
+    # (20480, 4096, 512): 1189.5,
+    # (32768, 3072, 1536): 1901.37,
+    # (32768, 4096, 512): 1225.25,
+    # (96, 3072, 1536): 172.18,
+    # (32768, 7168, 2048): 2178.01,
+    (8192, 256, 7168): 1078.19, # 90% 4W 64x128 SK=1
+    # (8192, 2112, 7168): 2065.74, # 95% 4W 128x128 SK=1
+    # (8192, 3072, 1536): 1583.00, # 96% 8W 256x256 SK=1
+    # (16384, 256, 7168): 1380.36, # 98% 4W 128x128 SK=1
 }
 
 BLOCK_K = 128
@@ -262,31 +260,29 @@ def _valid_splits(K):
 if __name__ == "__main__":
     torch.set_default_device("cuda")
 
-    # print("=== 4-wave split-k ===")
-    # for m, n, k in DS_SMALL_SHAPES_4W:
-    #     bm = bn = 64
-    #     splits = _valid_splits(k)
-    #     print(f"--- M={m} N={n} K={k} valid splits: {splits} ---")
-    #     for ns in splits:
-    #         test_fp8_gemm_4wave(
-    #             M=m, N=n, K=k,
-    #             tile_m=bm, tile_n=bn,
-    #             num_splits=ns,
-    #             num_iters=100,
-    #             num_warmups=10
-    #         )
 
-    print("\n=== 8-wave ===")
-    for s in DS_SHAPES_8W.keys():
-        target_perf = DS_SHAPES_8W[s]
+    for s in DS_SHAPES_TUNE.keys():
+        target_perf = DS_SHAPES_TUNE[s]
         m, n, k = s
-        bm, bn = 256, 256
-        perf_8w = test_fp8_gemm_4wave(
+        bm, bn = 64, 128
+        stages = 5
+        # for bm in [64, 128]:
+        #     for bn in [64, 128]:
+        #         for stages in [2, 3, 4]:
+        perf_4w = test_fp8_gemm_4wave(
             M=m, N=n, K=k,
             tile_m=bm, tile_n=bn,
             num_splits=1,
+            num_lds_stages=stages,
             num_iters=1000,
             num_warmups=1000
         )
+        print(f'[4W lds_stages={stages} {bm}x{bn}] M={m} N={n} K={k} preshuffle_gemm.py perf={target_perf:.2f}TFLOPS got={perf_4w:.2f}TFLOPS ({(perf_4w / target_perf) * 100:.1f}%)')
 
-        print(f'M={m} N={n} K={k} preshuffle_gemm.py perf={target_perf:.2f}TFLOPS got={perf_8w:.2f}TFLOPS ({(perf_8w / target_perf) * 100:.1f}%)')
+    # for s in DS_SHAPES_TUNE.keys():
+    #     target_perf = DS_SHAPES_TUNE[s]
+    #     m, n, k = s
+    #     cfg = bench_gemm(
+    #         M=m, N=n, K=k
+    #     )
+    #     print(f'[{cfg.num_waves}W {cfg.tile_m}x{cfg.tile_n} SK={cfg.num_split}] M={m} N={n} K={k} preshuffle_gemm.py perf={target_perf:.2f}TFLOPS got={cfg.tflops:.2f}TFLOPS ({(cfg.tflops / target_perf) * 100:.1f}%)')

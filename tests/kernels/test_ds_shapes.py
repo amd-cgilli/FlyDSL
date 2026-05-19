@@ -22,7 +22,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 
-from tests.kernels.gemm_tuning_utils import FlyGemmConfig, bench_gemm, bench_preshuffle_gemm, bench_torch_scaled_mm
+from tests.kernels.gemm_tuning_utils import FlyGemmConfig, bench_gemm, bench_torch_scaled_mm
 
 CSV_URL = (
     "https://raw.githubusercontent.com/ROCm/aiter/main/"

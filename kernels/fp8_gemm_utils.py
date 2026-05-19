@@ -202,7 +202,6 @@ def wait_barrier(count):
         res=None,
         operands_=[],
         asm_string=f"s_waitcnt vmcnt({count})",
-        # asm_string=f"s_waitcnt vmcnt({count})\ns_barrier",
         constraints="",
         has_side_effects=True,
     )
