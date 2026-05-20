@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import fly as fly_dialect
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
-from flydsl.expr import arith, const_expr, range_constexpr
+from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr
 from flydsl.expr.typing import Vector as Vec
 
 
@@ -131,13 +132,15 @@ class S2RLoader:
 
 
 class StoreC:
-    def __init__(self, A_scale, B_scale, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b):
+    def __init__(self, A_scale, B_scale, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, is_split_k, m_pad):
         self.c_rows = c_rows
         self.c_cols = c_cols
         self.lane_id = fx.thread_idx.x % 64
         self.c_idx_fn = c_idx_fn
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
+        self.is_split_k = is_split_k
+        self.m_pad = m_pad
         gC = fx.rocdl.make_buffer_tensor(C, max_size=False)
         gSA = fx.rocdl.make_buffer_tensor(A_scale, max_size=False)
         gSB = fx.rocdl.make_buffer_tensor(B_scale, max_size=False)
@@ -147,7 +150,11 @@ class StoreC:
 
         self.scale_atom_4 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
         self.scale_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-        self.out_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16)
+        if const_expr(is_split_k):
+            self.out_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+            self.split_k_idx = fx.block_idx.y
+        else:
+            self.out_atom = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16)
         self.reg_f32_4 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
         self.reg_f32_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
         self.reg_bf16_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.BFloat16)
@@ -160,17 +167,28 @@ class StoreC:
         fx.copy(self.scale_atom_1, fx.slice(self.sb_div, (None, fx.Int32(col))), self.reg_f32_1)
         return Vec(fx.memref_load_vec(self.reg_f32_1))[0]
 
-    def _store_bf16(self, value_bf16, c_index):
-        fx.memref_store_vec(Vec.filled(1, value_bf16, fx.BFloat16), self.reg_bf16_1)
-        fx.copy(self.out_atom_1, self.reg_bf16_1, fx.slice(self.c_div, (None, fx.Int32(c_index))))
+    def _store(self, val, dtype, reg_t, c_index):
+        fx.memref_store_vec(Vec.filled(1, val, dtype), reg_t)
+        fx.copy(self.out_atom, reg_t, fx.slice(self.c_div, (None, fx.Int32(c_index))))
+
+    def load_a_scales(self, base_row):
+        return [
+            self._load_scale_vec4(base_row + i * 16 + (self.lane_id // 16) * 4)
+            for i in range_constexpr(self.n_tiles_a)
+        ]
+
+    def load_b_scales(self, base_col):
+        return [
+            self._load_scale_scalar(base_col + i * 16 + self.lane_id % 16)
+            for i in range_constexpr(self.n_tiles_b)
+        ]
 
     def store(self, c_frag, base_row, base_col):
-        a_scales = [
-            self._load_scale_vec4(base_row + i * 16 + (self.lane_id // 16) * 4) for i in range_constexpr(self.n_tiles_a)
-        ]
-        b_scales = [
-            self._load_scale_scalar(base_col + i * 16 + self.lane_id % 16) for i in range_constexpr(self.n_tiles_b)
-        ]
+        a_scales = self.load_a_scales(base_row)
+        b_scales = self.load_b_scales(base_col)
+        self.store_with_scales(c_frag, base_row, base_col, a_scales, b_scales)
+
+    def store_with_scales(self, c_frag, base_row, base_col, a_scales, b_scales):
         for ti in range_constexpr(self.n_tiles_a):
             row = base_row + ti * 16 + (self.lane_id // 16) * 4
             for tj in range_constexpr(self.n_tiles_b):
@@ -179,9 +197,13 @@ class StoreC:
                 oob = fx.Int32(self.c_rows * self.c_cols)
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
                 for i in range_constexpr(4):
-                    scaled = (vec_f32[i] * (a_scales[ti][i] * b_scales[tj])).to(fx.BFloat16)
-                    c_index = (row + i) * self.c_cols + col
-                    self._store_bf16(scaled, arith.select(col_valid, c_index, oob))
+                    scaled = vec_f32[i] * (a_scales[ti][i] * b_scales[tj])
+                    if const_expr(self.is_split_k):
+                        ws_offset = self.split_k_idx * self.m_pad * self.c_cols + (row + i) * self.c_cols + col
+                        self._store(scaled, fx.Float32, self.reg_f32_1, ws_offset)
+                    else:
+                        c_index = (row + i) * self.c_cols + col
+                        self._store(scaled.to(fx.BFloat16), fx.BFloat16, self.reg_bf16_1, arith.select(col_valid, c_index, oob))
 
 
 def wait_barrier(count):
@@ -192,6 +214,36 @@ def wait_barrier(count):
         constraints="",
         has_side_effects=True,
     )
+
+
+def compile_splitk_reduce(block_m, num_splits):
+    REDUCE_BLOCK = 256
+    REDUCE_VEC = 4
+    REDUCE_ELEMS_PER_BLOCK = REDUCE_BLOCK * REDUCE_VEC
+
+    @flyc.kernel
+    def reduce_kernel(C_ws: fx.Tensor, C: fx.Tensor, c_m: fx.Int32, c_n: fx.Int32):
+        m_pad = ceildiv(c_m, block_m) * block_m
+        c_ws_rsrc = buffer_ops.create_buffer_resource(
+            C_ws, max_size=False, num_records_bytes=num_splits * (m_pad * c_n * 4)
+        )
+        c_rsrc = buffer_ops.create_buffer_resource(C, max_size=False, num_records_bytes=c_m * c_n * 2)
+
+        base_idx = fx.block_idx.x * REDUCE_ELEMS_PER_BLOCK + fx.thread_idx.x * REDUCE_VEC
+        if base_idx < c_m * c_n:
+            acc = Vec(buffer_ops.buffer_load(c_ws_rsrc, fx.Int32(base_idx), vec_width=4, dtype=fx.Float32))
+            for s in range_constexpr(num_splits - 1):
+                ws_offset = (s + 1) * m_pad * c_n + base_idx
+                val = Vec(buffer_ops.buffer_load(c_ws_rsrc, fx.Int32(ws_offset), vec_width=4, dtype=fx.Float32))
+                acc = acc + val
+            buffer_ops.buffer_store(acc.to(fx.BFloat16), c_rsrc, fx.Int32(base_idx))
+
+    @flyc.jit
+    def launch_reduce(C_ws: fx.Tensor, C: fx.Tensor, c_m: fx.Int32, c_n: fx.Int32, stream: fx.Stream):
+        grid_x = ceildiv(c_m * c_n, REDUCE_ELEMS_PER_BLOCK)
+        reduce_kernel(C_ws, C, c_m, c_n).launch(grid=(grid_x, 1, 1), block=(REDUCE_BLOCK, 1, 1), stream=stream)
+
+    return launch_reduce
 
 
 class Mfma16x16x128:
