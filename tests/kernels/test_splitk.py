@@ -144,6 +144,7 @@ def test_fp8_gemm_8wave(
     tile_n: int,
     *,
     num_splits: int = 1,
+    num_lds_stages: int = 2,
     num_warmups: int = 2,
     num_iters: int = 10,
 ):
@@ -172,7 +173,8 @@ def test_fp8_gemm_8wave(
         M=M, N=N, K=K,
         BLOCK_M=tile_m,
         BLOCK_N=tile_n,
-        n_splits=num_splits)
+        n_splits=num_splits,
+        num_lds_stages=num_lds_stages)
     # print(f"✓ 8wave kernel prepared (M={M} N={N} K={K} BLOCK_M={tile_m} BLOCK_N={tile_n} "
     #       f"NUM_SPLITS={num_splits})")
 
@@ -235,14 +237,14 @@ def test_fp8_gemm_8wave(
 
 DS_SHAPES_TUNE = {
     # (1, 256, 7168): 0.54,
-    # (16384, 8192, 512): 1207.11,
-    # (20480, 3072, 1536): 1824.61,
-    # (20480, 4096, 512): 1189.5,
-    # (32768, 3072, 1536): 1901.37,
-    # (32768, 4096, 512): 1225.25,
+    (16384, 8192, 512): 1207.11,
+    (20480, 3072, 1536): 1824.61,
+    (20480, 4096, 512): 1189.5,
+    (32768, 3072, 1536): 1901.37,
+    (32768, 4096, 512): 1225.25,
     # (96, 3072, 1536): 172.18,
     # (32768, 7168, 2048): 2178.01,
-    (8192, 256, 7168): 1078.19, # 90% 4W 64x128 SK=1
+    # (8192, 256, 7168): 1078.19, # 90% 4W 64x128 SK=1
     # (8192, 2112, 7168): 2065.74, # 95% 4W 128x128 SK=1
     # (8192, 3072, 1536): 1583.00, # 96% 8W 256x256 SK=1
     # (16384, 256, 7168): 1380.36, # 98% 4W 128x128 SK=1
@@ -264,12 +266,12 @@ if __name__ == "__main__":
     for s in DS_SHAPES_TUNE.keys():
         target_perf = DS_SHAPES_TUNE[s]
         m, n, k = s
-        bm, bn = 64, 128
-        stages = 4
+        bm, bn = 256, 256
+        stages = 2
         # for bm in [64, 128]:
         #     for bn in [64, 128]:
         #         for stages in [2, 3, 4]:
-        perf_4w = test_fp8_gemm_4wave(
+        perf_4w = test_fp8_gemm_8wave(
             M=m, N=n, K=k,
             tile_m=bm, tile_n=bn,
             num_splits=1,
@@ -277,7 +279,7 @@ if __name__ == "__main__":
             num_iters=1000,
             num_warmups=1000
         )
-        print(f'[4W lds_stages={stages} {bm}x{bn}] M={m} N={n} K={k} preshuffle_gemm.py perf={target_perf:.2f}TFLOPS got={perf_4w:.2f}TFLOPS ({(perf_4w / target_perf) * 100:.1f}%)')
+        print(f'[8W lds_stages={stages} {bm}x{bn}] M={m} N={n} K={k} preshuffle_gemm.py perf={target_perf:.2f}TFLOPS got={perf_4w:.2f}TFLOPS ({(perf_4w / target_perf) * 100:.1f}%)')
 
     # for s in DS_SHAPES_TUNE.keys():
     #     target_perf = DS_SHAPES_TUNE[s]

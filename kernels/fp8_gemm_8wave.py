@@ -10,7 +10,7 @@ Algorithm derived from HipKittens FP8_8wave
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import buffer_ops, range_constexpr, rocdl
+from flydsl.expr import buffer_ops, const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from kernels.fp8_gemm_utils import (
@@ -21,7 +21,7 @@ from kernels.fp8_gemm_utils import (
     ceildiv,
     compute_global_swizzle,
     make_fp8_buffer_tensor,
-    wait_barrier
+    wait_barrier,
 )
 
 
@@ -33,20 +33,22 @@ def compile_fp8_gemm_8w(
         BLOCK_M: int = 256,
         BLOCK_N: int = 256,
         b_preshuffled: bool = False,
-        n_splits: int = 1):
+        n_splits: int = 1,
+        num_lds_stages: int = 2):
     BLOCK_K = 128
 
     assert M >= 1 and N >= 1
     assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
     assert K % BLOCK_K == 0
 
+    assert num_lds_stages in [2, 3], f"num_lds_stages must be 2 or 3, got {num_lds_stages}"
     assert n_splits >= 1
     assert K % n_splits == 0, f"K ({K}) must be divisible by n_splits ({n_splits})"
     K_PER_SPLIT = K // n_splits
     assert K_PER_SPLIT % BLOCK_K == 0, f"K_PER_SPLIT ({K_PER_SPLIT}) must be divisible by BLOCK_K ({BLOCK_K})"
     K_ITERS_PER_SPLIT = K_PER_SPLIT // BLOCK_K
-    assert K_ITERS_PER_SPLIT >= 2, (
-        f"Each split needs >= 2 K iterations for double-buffered prologue, "
+    assert K_ITERS_PER_SPLIT >= num_lds_stages, (
+        f"Each split needs >= {num_lds_stages} K iterations for multi-buffered prologue, "
         f"got {K_ITERS_PER_SPLIT} (K={K}, n_splits={n_splits}, BLOCK_K={BLOCK_K})"
     )
     _is_split_k = n_splits > 1
@@ -68,27 +70,25 @@ def compile_fp8_gemm_8w(
     N_LDS_STEPS_B = LDS_BLOCK_N // 64
     N_LDS_ROUNDS = max(N_LDS_STEPS_A, N_LDS_STEPS_B)
 
-    A_lds_cur0_alloc = SmemAllocator(None, "gfx950", "A_lds_cur_0")
-    A_lds_cur1_alloc = SmemAllocator(None, "gfx950", "A_lds_cur_1")
-    A_lds_next0_alloc = SmemAllocator(None, "gfx950", "A_lds_next_0")
-    A_lds_next1_alloc = SmemAllocator(None, "gfx950", "A_lds_next_1")
-    B_lds_cur0_alloc = SmemAllocator(None, "gfx950", "B_lds_cur_0")
-    B_lds_cur1_alloc = SmemAllocator(None, "gfx950", "B_lds_cur_1")
-    B_lds_next0_alloc = SmemAllocator(None, "gfx950", "B_lds_next_0")
-    B_lds_next1_alloc = SmemAllocator(None, "gfx950", "B_lds_next_1")
+    assert num_lds_stages * (BLOCK_M * BLOCK_K + BLOCK_N * BLOCK_K) <= 160 * 1024, f"LDS too small for {num_lds_stages}-buffering with {BLOCK_M}x{BLOCK_N} tiles"
 
     # half size
     a_lds_size = LDS_BLOCK_M * BLOCK_K
     b_lds_size = LDS_BLOCK_N * BLOCK_K
 
-    A_lds_cur0_alloc.ptr = a_lds_size
-    A_lds_cur1_alloc.ptr = a_lds_size
-    A_lds_next0_alloc.ptr = a_lds_size
-    A_lds_next1_alloc.ptr = a_lds_size
-    B_lds_cur0_alloc.ptr = b_lds_size
-    B_lds_cur1_alloc.ptr = b_lds_size
-    B_lds_next0_alloc.ptr = b_lds_size
-    B_lds_next1_alloc.ptr = b_lds_size
+    A_lds_allocs = [
+        [SmemAllocator(None, "gfx950", f'A_lds_{s}{h}') for h in range_constexpr(2)]
+        for s in range_constexpr(num_lds_stages)
+    ]
+    B_lds_allocs = [
+        [SmemAllocator(None, "gfx950", f'B_lds_{s}{h}') for h in range_constexpr(2)]
+        for s in range_constexpr(num_lds_stages)
+    ]
+    for stage in range_constexpr(num_lds_stages):
+        for h in range_constexpr(2):
+            A_lds_allocs[stage][h].ptr = a_lds_size
+            B_lds_allocs[stage][h].ptr = b_lds_size
+
 
     @flyc.kernel(known_block_size=[512, 1, 1])
     def kernel_gemm(
@@ -100,15 +100,14 @@ def compile_fp8_gemm_8w(
     ):
         F8_IR_t = fx.Float8E4M3FN.ir_type
 
-        a_cur0 = SmemPtr(A_lds_cur0_alloc.get_base(), 0, F8_IR_t, shape=(a_lds_size,)).get()
-        a_cur1 = SmemPtr(A_lds_cur1_alloc.get_base(), 0, F8_IR_t, shape=(a_lds_size,)).get()
-        a_next0 = SmemPtr(A_lds_next0_alloc.get_base(), 0, F8_IR_t, shape=(a_lds_size,)).get()
-        a_next1 = SmemPtr(A_lds_next1_alloc.get_base(), 0, F8_IR_t, shape=(a_lds_size,)).get()
-
-        b_cur0 = SmemPtr(B_lds_cur0_alloc.get_base(), 0, F8_IR_t, shape=(b_lds_size,)).get()
-        b_cur1 = SmemPtr(B_lds_cur1_alloc.get_base(), 0, F8_IR_t, shape=(b_lds_size,)).get()
-        b_next0 = SmemPtr(B_lds_next0_alloc.get_base(), 0, F8_IR_t, shape=(b_lds_size,)).get()
-        b_next1 = SmemPtr(B_lds_next1_alloc.get_base(), 0, F8_IR_t, shape=(b_lds_size,)).get()
+        a_lds = [
+            [SmemPtr(A_lds_allocs[s][h].get_base(), 0, F8_IR_t, shape=(a_lds_size,)).get() for h in range_constexpr(2)]
+            for s in range_constexpr(num_lds_stages)
+        ]
+        b_lds = [
+            [SmemPtr(B_lds_allocs[s][h].get_base(), 0, F8_IR_t, shape=(b_lds_size,)).get() for h in range_constexpr(2)]
+            for s in range_constexpr(num_lds_stages)
+        ]
 
         lane_id = fx.thread_idx.x % 64
         wave_id = fx.thread_idx.x // 64
@@ -148,131 +147,117 @@ def compile_fp8_gemm_8w(
         c10_frag = [mfma.zero_value] * N_ACCUMS
         c11_frag = [mfma.zero_value] * N_ACCUMS
 
-        b_g2s.load(b_cur0, B0_gl_offset + 0 * B_K_STEP)
-        a_g2s.load(a_cur0, A0_gl_offset + 0 * BLOCK_K)
-        b_g2s.load(b_cur1, B1_gl_offset + 0 * B_K_STEP)
-        a_g2s.load(a_cur1, A1_gl_offset + 0 * BLOCK_K)
-
-        # if wave_m == 1:
-        #     rocdl.s_barrier()
+        # Prologue: fill stage 0 fully, then stages 1..num_lds_stages-1 partially
+        # (A1 of the last prologue stage is deferred to the loop body).
+        # Stage 0: all 4 halves.
+        b_g2s.load(b_lds[0][0], B0_gl_offset + 0 * B_K_STEP)
+        a_g2s.load(a_lds[0][0], A0_gl_offset + 0 * BLOCK_K)
+        b_g2s.load(b_lds[0][1], B1_gl_offset + 0 * B_K_STEP)
+        a_g2s.load(a_lds[0][1], A1_gl_offset + 0 * BLOCK_K)
 
         wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
 
-        b_g2s.load(b_next0, B0_gl_offset + 1 * B_K_STEP)
-        a_g2s.load(a_next0, A0_gl_offset + 1 * BLOCK_K)
-        b_g2s.load(b_next1, B1_gl_offset + 1 * B_K_STEP)
+        # Stages 1..num_lds_stages-1: load B0, A0, B1 (A1 deferred).
+        for s in range_constexpr(num_lds_stages - 1):
+            b_g2s.load(b_lds[s + 1][0], B0_gl_offset + (s + 1) * B_K_STEP)
+            a_g2s.load(a_lds[s + 1][0], A0_gl_offset + (s + 1) * BLOCK_K)
+            b_g2s.load(b_lds[s + 1][1], B1_gl_offset + (s + 1) * B_K_STEP)
 
         wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
 
-        for k in range_constexpr(K_ITERS - 2):
-            b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
-            a0_frag = a_s2r.load(a_cur0)
-            a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
-            # rocdl.s_barrier()
+        cs = 0
+        for k in range_constexpr(K_ITERS - num_lds_stages):
+            ns = (cs + 1) % num_lds_stages
+            ld = cs
+
+            b0_frag = b_s2r.load(b_lds[cs][0], preshuffled=b_preshuffled)
+            a0_frag = a_s2r.load(a_lds[cs][0])
+            a_g2s.load(a_lds[ns][1], A1_gl_offset + (k + 1) * BLOCK_K)
 
             rocdl.s_setprio(1)
             c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
             rocdl.s_setprio(0)
-            # rocdl.s_barrier()
 
-            b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
-            b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * B_K_STEP)
-            # rocdl.s_barrier()
+            b1_frag = b_s2r.load(b_lds[cs][1], preshuffled=b_preshuffled)
+            b_g2s.load(b_lds[ld][0], B0_gl_offset + (k + num_lds_stages) * B_K_STEP)
 
             rocdl.s_setprio(1)
             c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
             rocdl.s_setprio(0)
-            # rocdl.s_barrier()
 
-            a1_frag = a_s2r.load(a_cur1)
-            a_g2s.load(a_cur0, A0_gl_offset + (k + 2) * BLOCK_K)
-            # rocdl.s_barrier()
+            a1_frag = a_s2r.load(a_lds[cs][1])
+            a_g2s.load(a_lds[ld][0], A0_gl_offset + (k + num_lds_stages) * BLOCK_K)
 
             rocdl.s_setprio(1)
             c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
             rocdl.s_setprio(0)
-            # rocdl.s_barrier()
 
-            b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * B_K_STEP)
+            b_g2s.load(b_lds[ld][1], B1_gl_offset + (k + num_lds_stages) * B_K_STEP)
             wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
 
             rocdl.s_setprio(1)
             c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
             rocdl.s_setprio(0)
-            # rocdl.s_barrier()
 
-            # Swap cur and next
-            a_cur0, a_next0 = a_next0, a_cur0
-            a_cur1, a_next1 = a_next1, a_cur1
-            b_cur0, b_next0 = b_next0, b_cur0
-            b_cur1, b_next1 = b_next1, b_cur1
+            cs = ns
 
-        # Step k = K_ITERS - 2
-        k = K_ITERS - 2
-        b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
-        a0_frag = a_s2r.load(a_cur0)
-        # rocdl.s_barrier()
+        # Tail: drain remaining num_lds_stages K-tiles without issuing new B0/A0/B1 g2s.
+        # For num_lds_stages > 2, each drain step issues the deferred A1 load for the
+        # next stage (the main loop only loaded B0/A0/B1 into those stages). The MFMA
+        # latency between issue and the next step's read covers the VMEM latency, same
+        # as in the main loop. The final step's wait_barrier(0) catches stragglers.
+        for _t in range_constexpr(num_lds_stages - 1):
+            ns = (cs + 1) % num_lds_stages
 
-        rocdl.s_setprio(1)
-        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
-        rocdl.s_setprio(0)
-        # rocdl.s_barrier()
+            b0_frag = b_s2r.load(b_lds[cs][0], preshuffled=b_preshuffled)
+            a0_frag = a_s2r.load(a_lds[cs][0])
+            if const_expr(num_lds_stages > 2):
+                a_g2s.load(a_lds[ns][1], A1_gl_offset + (K_ITERS - num_lds_stages + _t + 1) * BLOCK_K)
 
-        b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
-        # rocdl.s_barrier()
+            rocdl.s_setprio(1)
+            c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
+            rocdl.s_setprio(0)
 
-        rocdl.s_setprio(1)
-        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
-        rocdl.s_setprio(0)
-        # rocdl.s_barrier()
+            b1_frag = b_s2r.load(b_lds[cs][1], preshuffled=b_preshuffled)
 
-        a1_frag = a_s2r.load(a_cur1)
-        # rocdl.s_barrier()
+            rocdl.s_setprio(1)
+            c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
+            rocdl.s_setprio(0)
 
-        rocdl.s_setprio(1)
-        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
-        rocdl.s_setprio(0)
-        # rocdl.s_barrier()
+            a1_frag = a_s2r.load(a_lds[cs][1])
 
-        b0_frag = b_s2r.load(b_next0, preshuffled=b_preshuffled)
-        # rocdl.s_barrier()
+            rocdl.s_setprio(1)
+            c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
+            rocdl.s_setprio(0)
 
-        rocdl.s_setprio(1)
-        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
-        rocdl.s_setprio(0)
-        # rocdl.s_barrier()
-        # Swap cur and next
-        a_cur0, a_next0 = a_next0, a_cur0
-        a_cur1, a_next1 = a_next1, a_cur1
-        b_cur0, b_next0 = b_next0, b_cur0
-        b_cur1, b_next1 = b_next1, b_cur1
+            b0_frag = b_s2r.load(b_lds[ns][0], preshuffled=b_preshuffled)
 
-        # Step k = K_ITERS - 1
-        k = K_ITERS - 1
-        a0_frag = a_s2r.load(a_cur0)
+            rocdl.s_setprio(1)
+            c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
+            rocdl.s_setprio(0)
+
+            cs = ns
+
+        # Final K-tile.
+        a0_frag = a_s2r.load(a_lds[cs][0])
         wait_barrier(0)
 
         rocdl.s_setprio(1)
         c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
         rocdl.s_setprio(0)
-        # rocdl.s_barrier()
 
-        b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
-        # rocdl.s_barrier()
+        b1_frag = b_s2r.load(b_lds[cs][1], preshuffled=b_preshuffled)
 
         rocdl.s_setprio(1)
         c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
         rocdl.s_setprio(0)
-        # rocdl.s_barrier()
 
-        a1_frag = a_s2r.load(a_cur1)
-        # rocdl.s_barrier()
+        a1_frag = a_s2r.load(a_lds[cs][1])
 
         rocdl.s_setprio(1)
         c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
         c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
         rocdl.s_setprio(0)
-        # rocdl.s_barrier()
 
         # Scale and store back to gmem
         wave_n_offset = wave_n * (N_TILES_B * 16)
@@ -301,24 +286,16 @@ def compile_fp8_gemm_8w(
     ):
         from flydsl._mlir import ir
 
-        A_lds_cur0_alloc.finalized = False
-        A_lds_cur1_alloc.finalized = False
-        A_lds_next0_alloc.finalized = False
-        A_lds_next1_alloc.finalized = False
-        B_lds_cur0_alloc.finalized = False
-        B_lds_cur1_alloc.finalized = False
-        B_lds_next0_alloc.finalized = False
-        B_lds_next1_alloc.finalized = False
+        for stage in range_constexpr(num_lds_stages):
+            for h in range_constexpr(2):
+                A_lds_allocs[stage][h].finalized = False
+                B_lds_allocs[stage][h].finalized = False
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
-            A_lds_cur0_alloc.finalize()
-            A_lds_cur1_alloc.finalize()
-            A_lds_next0_alloc.finalize()
-            A_lds_next1_alloc.finalize()
-            B_lds_cur0_alloc.finalize()
-            B_lds_cur1_alloc.finalize()
-            B_lds_next0_alloc.finalize()
-            B_lds_next1_alloc.finalize()
+            for stage in range_constexpr(num_lds_stages):
+                for h in range_constexpr(2):
+                    A_lds_allocs[stage][h].finalize()
+                    B_lds_allocs[stage][h].finalize()
         grid_x = ceildiv(M, BLOCK_M) * N_BLOCKS
         kernel_gemm(
             A,

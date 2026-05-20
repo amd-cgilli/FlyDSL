@@ -101,7 +101,7 @@ def _bench_fp8_gemm(
     b_kernel = preshuffle_b(b_q) if b_preshuffled else b_q
 
     if use_8w:
-        launch_fn = compile_fp8_gemm_8w(
+        launch_fn, _ = compile_fp8_gemm_8w(
             M=M,
             N=N,
             K=K,
@@ -111,7 +111,7 @@ def _bench_fp8_gemm(
         )
         print(f"\n[fp8_gemm_8wave] M={M} N={N} K={K} BLOCK_M={tile_m} BLOCK_N={tile_n} preshuffle_b={b_preshuffled}")
     else:
-        launch_fn = compile_fp8_gemm_4w(
+        launch_fn, _ = compile_fp8_gemm_4w(
             M=M,
             N=N,
             K=K,
