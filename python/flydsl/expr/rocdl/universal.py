@@ -2,7 +2,7 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 
 from ..._mlir import ir
-from ..._mlir._mlir_libs._mlirDialectsFlyROCDL import MmaOpGFX1250_WMMAType
+from ..._mlir._mlir_libs._mlirDialectsFlyROCDL import MmaOpGFX11_WMMAType, MmaOpGFX1250_WMMAType
 from ..._mlir.dialects.fly import AtomicOp, PointerType
 from ..._mlir.dialects.fly_rocdl import (
     CopyOpCDNA3BufferAtomicType,
@@ -12,14 +12,7 @@ from ..._mlir.dialects.fly_rocdl import (
     TargetAddressSpace,
 )
 from ..._mlir.extras import types as T
-from ..primitive import (
-    cosize,
-    get_iter,
-    get_layout,
-    get_scalar,
-    make_ptr,
-    make_view,
-)
+from ..primitive import cosize, get_iter, get_layout, get_scalar, make_ptr, make_view
 from ..typing import Int16, Int32, Int64, Tensor
 
 
@@ -89,7 +82,20 @@ def WMMA(m, n, k, elem_ty_ab, elem_ty_acc=None):
         ty_acc = ir.F32Type.get()
     else:
         ty_acc = elem_ty_acc.ir_type if hasattr(elem_ty_acc, "ir_type") else elem_ty_acc
-    return MmaOpGFX1250_WMMAType.get(m, n, k, ty_ab, ty_ab, ty_acc)
+
+    # Arch-aware dispatch:
+    #   * RDNA3 / RDNA3.5 (gfx1100..gfx1152) use the legacy v16-operand WMMA ABI.
+    #   * RDNA4 (gfx1250)                    uses the new v8-operand ABI.
+    from ...runtime.device import get_rocm_arch
+
+    arch = (get_rocm_arch() or "").lower()
+    if arch.startswith("gfx11"):
+        return MmaOpGFX11_WMMAType.get(m, n, k, ty_ab, ty_ab, ty_acc)
+    if arch.startswith("gfx12"):
+        return MmaOpGFX1250_WMMAType.get(m, n, k, ty_ab, ty_ab, ty_acc)
+    raise ValueError(
+        f"WMMA is not available on target arch {arch!r}; " "supported: gfx11xx (RDNA3 / RDNA3.5) and gfx12xx (RDNA4). "
+    )
 
 
 def make_buffer_tensor(tensor: Tensor, max_size: bool = True) -> Tensor:
