@@ -6,7 +6,7 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import fly as fly_dialect
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
-from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr
+from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr.typing import Vector as Vec
 
 
@@ -173,15 +173,11 @@ class StoreC:
 
     def load_a_scales(self, base_row):
         return [
-            self._load_scale_vec4(base_row + i * 16 + (self.lane_id // 16) * 4)
-            for i in range_constexpr(self.n_tiles_a)
+            self._load_scale_vec4(base_row + i * 16 + (self.lane_id // 16) * 4) for i in range_constexpr(self.n_tiles_a)
         ]
 
     def load_b_scales(self, base_col):
-        return [
-            self._load_scale_scalar(base_col + i * 16 + self.lane_id % 16)
-            for i in range_constexpr(self.n_tiles_b)
-        ]
+        return [self._load_scale_scalar(base_col + i * 16 + self.lane_id % 16) for i in range_constexpr(self.n_tiles_b)]
 
     def store(self, c_frag, base_row, base_col):
         a_scales = self.load_a_scales(base_row)
@@ -203,7 +199,9 @@ class StoreC:
                         self._store(scaled, fx.Float32, self.reg_f32_1, ws_offset)
                     else:
                         c_index = (row + i) * self.c_cols + col
-                        self._store(scaled.to(fx.BFloat16), fx.BFloat16, self.reg_bf16_1, arith.select(col_valid, c_index, oob))
+                        self._store(
+                            scaled.to(fx.BFloat16), fx.BFloat16, self.reg_bf16_1, arith.select(col_valid, c_index, oob)
+                        )
 
 
 def wait_barrier(count):
@@ -223,20 +221,28 @@ def compile_splitk_reduce(block_m, num_splits):
 
     @flyc.kernel
     def reduce_kernel(C_ws: fx.Tensor, C: fx.Tensor, c_m: fx.Int32, c_n: fx.Int32):
-        m_pad = ceildiv(c_m, block_m) * block_m
-        c_ws_rsrc = buffer_ops.create_buffer_resource(
-            C_ws, max_size=False, num_records_bytes=num_splits * (m_pad * c_n * 4)
-        )
-        c_rsrc = buffer_ops.create_buffer_resource(C, max_size=False, num_records_bytes=c_m * c_n * 2)
+        gCws = fx.rocdl.make_buffer_tensor(C_ws, max_size=False)
+        gC = fx.rocdl.make_buffer_tensor(C, max_size=False)
+        cws_div = fx.logical_divide(gCws, fx.make_layout(1, 1))
+        c_div = fx.logical_divide(gC, fx.make_layout(1, 1))
 
+        load_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
+        store_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.BFloat16)
+        reg_f32 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
+        reg_bf16 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.BFloat16)
+
+        m_pad = ceildiv(c_m, block_m) * block_m
         base_idx = fx.block_idx.x * REDUCE_ELEMS_PER_BLOCK + fx.thread_idx.x * REDUCE_VEC
         if base_idx < c_m * c_n:
-            acc = Vec(buffer_ops.buffer_load(c_ws_rsrc, fx.Int32(base_idx), vec_width=4, dtype=fx.Float32))
+            fx.copy(load_atom, fx.slice(cws_div, (None, fx.Int32(base_idx))), reg_f32)
+            acc = Vec(fx.memref_load_vec(reg_f32))
             for s in range_constexpr(num_splits - 1):
                 ws_offset = (s + 1) * m_pad * c_n + base_idx
-                val = Vec(buffer_ops.buffer_load(c_ws_rsrc, fx.Int32(ws_offset), vec_width=4, dtype=fx.Float32))
+                fx.copy(load_atom, fx.slice(cws_div, (None, fx.Int32(ws_offset))), reg_f32)
+                val = Vec(fx.memref_load_vec(reg_f32))
                 acc = acc + val
-            buffer_ops.buffer_store(acc.to(fx.BFloat16), c_rsrc, fx.Int32(base_idx))
+            fx.memref_store_vec(acc.to(fx.BFloat16), reg_bf16)
+            fx.copy(store_atom, reg_bf16, fx.slice(c_div, (None, fx.Int32(base_idx))))
 
     @flyc.jit
     def launch_reduce(C_ws: fx.Tensor, C: fx.Tensor, c_m: fx.Int32, c_n: fx.Int32, stream: fx.Stream):

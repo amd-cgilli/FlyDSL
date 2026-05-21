@@ -78,6 +78,8 @@ def _bench_fp8_gemm(
     num_iters: int = 10,
     vs_torch: bool = False,
     b_preshuffled: bool = False,
+    num_splits: int = 1,
+    num_lds_stages: int = 2,
 ):
     """Run + verify a single (M, N, K, tile) configuration. Returns TFLOPS."""
     if "gfx95" not in ARCH:
@@ -100,29 +102,43 @@ def _bench_fp8_gemm(
 
     b_kernel = preshuffle_b(b_q) if b_preshuffled else b_q
 
+    _is_split_k = num_splits > 1
+
+    if _is_split_k:
+        m_pad = ((M + tile_m - 1) // tile_m) * tile_m
+        c_ws = torch.zeros(num_splits * m_pad * N, dtype=torch.float32, device=device)
+    else:
+        c_ws = None
+
     if use_8w:
-        launch_fn = compile_fp8_gemm_8w(
+        launch_gemm, launch_reduce = compile_fp8_gemm_8w(
             K=K,
             BLOCK_M=tile_m,
             BLOCK_N=tile_n,
             b_preshuffled=b_preshuffled,
+            num_splits=num_splits,
         )
-        print(f"\n[fp8_gemm_8wave] M={M} N={N} K={K} BLOCK_M={tile_m} BLOCK_N={tile_n} preshuffle_b={b_preshuffled}")
+        print(
+            f"\n[fp8_gemm_8wave] M={M} N={N} K={K} BLOCK_M={tile_m} BLOCK_N={tile_n} "
+            f"preshuffle_b={b_preshuffled} num_splits={num_splits}"
+        )
     else:
-        launch_fn = compile_fp8_gemm_4w(
+        launch_gemm, launch_reduce = compile_fp8_gemm_4w(
             K=K,
             BLOCK_M=tile_m,
             BLOCK_N=tile_n,
             use_xcd_remap=not disable_xcd_remap,
             b_preshuffled=b_preshuffled,
+            num_splits=num_splits,
+            num_lds_stages=num_lds_stages,
         )
         print(
             f"\n[fp8_gemm_4wave] M={M} N={N} K={K} "
             f"BLOCK_M={tile_m} BLOCK_N={tile_n} xcd_remap={not disable_xcd_remap} "
-            f"preshuffle_b={b_preshuffled}"
+            f"preshuffle_b={b_preshuffled} num_splits={num_splits} num_lds_stages={num_lds_stages}"
         )
 
-    def _args(c, a, b, sa, sb):
+    def _gemm_args(c, a, b, sa, sb):
         return (
             _as_i8(a).contiguous().view(-1),
             _as_i8(b).contiguous().view(-1),
@@ -134,10 +150,33 @@ def _bench_fp8_gemm(
             torch.cuda.current_stream(),
         )
 
-    compiled = flyc.compile(launch_fn, *_args(c_out_raw, a_q, b_kernel, scale_a, scale_b))
+    if _is_split_k:
+        compiled_gemm = flyc.compile(launch_gemm, *_gemm_args(c_ws, a_q, b_kernel, scale_a, scale_b))
+        compiled_reduce = flyc.compile(
+            launch_reduce,
+            c_ws.contiguous().view(-1),
+            c_out_raw.contiguous().view(-1),
+            M,
+            N,
+            torch.cuda.current_stream(),
+        )
 
-    def _launch(c, a, b, sa, sb):
-        compiled(*_args(c, a, b, sa, sb))
+        def _launch(c, a, b, sa, sb):
+            c_ws.zero_()
+            compiled_gemm(*_gemm_args(c_ws, a, b, sa, sb))
+            compiled_reduce(
+                c_ws.contiguous().view(-1),
+                c.contiguous().view(-1),
+                M,
+                N,
+                torch.cuda.current_stream(),
+            )
+
+    else:
+        compiled = flyc.compile(launch_gemm, *_gemm_args(c_out_raw, a_q, b_kernel, scale_a, scale_b))
+
+        def _launch(c, a, b, sa, sb):
+            compiled(*_gemm_args(c, a, b, sa, sb))
 
     num_iters = max(2, int(num_iters))
     _, us = run_perftest(
@@ -209,6 +248,30 @@ def test_fp8_gemm_4wave(M, N, K, tile_m, tile_n, preshuffle_b):
 
 
 @pytest.mark.parametrize(
+    "M, N, K, tile_m, tile_n, num_splits, num_lds_stages",
+    [
+        pytest.param(1, 256, 7168, 64, 64, 28, 2, id="1x256x7168_sk28"),
+        pytest.param(1, 256, 7168, 64, 64, 1, 4, id="1x256x7168_lds4"),
+        pytest.param(8192, 256, 7168, 128, 128, 2, 2, id="8192x256x7168_sk2"),
+        pytest.param(8192, 256, 7168, 128, 128, 1, 3, id="8192x256x7168_lds3"),
+    ],
+)
+@pytest.mark.parametrize("preshuffle_b", [False, True], ids=["rowmajor", "preshuffle_b"])
+def test_fp8_gemm_4wave_splitk(M, N, K, tile_m, tile_n, num_splits, num_lds_stages, preshuffle_b):
+    _bench_fp8_gemm(
+        M=M,
+        N=N,
+        K=K,
+        use_8w=False,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        b_preshuffled=preshuffle_b,
+        num_splits=num_splits,
+        num_lds_stages=num_lds_stages,
+    )
+
+
+@pytest.mark.parametrize(
     "M, N, K, tile_m, tile_n",
     [
         pytest.param(512, 2112, 7168, 128, 256, id="512x2112x7168"),
@@ -227,6 +290,26 @@ def test_fp8_gemm_8wave(M, N, K, tile_m, tile_n, preshuffle_b):
         tile_m=tile_m,
         tile_n=tile_n,
         b_preshuffled=preshuffle_b,
+    )
+
+
+@pytest.mark.parametrize(
+    "M, N, K, tile_m, tile_n, num_splits",
+    [
+        pytest.param(8192, 7168, 4096, 256, 256, 4, id="8192x8192x8192_sk2"),
+    ],
+)
+@pytest.mark.parametrize("preshuffle_b", [False, True], ids=["rowmajor", "preshuffle_b"])
+def test_fp8_gemm_8wave_splitk(M, N, K, tile_m, tile_n, num_splits, preshuffle_b):
+    _bench_fp8_gemm(
+        M=M,
+        N=N,
+        K=K,
+        use_8w=True,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        b_preshuffled=preshuffle_b,
+        num_splits=num_splits,
     )
 
 
@@ -270,6 +353,18 @@ if __name__ == "__main__":
         default=False,
         help="Use 8-Wave Ping-Pong variant.",
     )
+    parser.add_argument(
+        "--num_splits",
+        type=int,
+        default=1,
+        help="Split-K factor (default 1 = no split).",
+    )
+    parser.add_argument(
+        "--num_lds_stages",
+        type=int,
+        default=2,
+        help="Number of LDS pipeline stages (4-wave only, default 2).",
+    )
     args = parser.parse_args()
 
     torch.set_default_device("cuda")
@@ -287,6 +382,8 @@ if __name__ == "__main__":
             num_iters=args.num_iters,
             vs_torch=args.vs_torch,
             b_preshuffled=args.preshuffle_b,
+            num_splits=args.num_splits,
+            num_lds_stages=args.num_lds_stages,
         )
     except pytest.skip.Exception as e:
         print(f"Skipped: {e}")
