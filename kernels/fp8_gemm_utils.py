@@ -24,6 +24,37 @@ def divmod(a: int, b: int) -> tuple[int, int]:
     return (a // b, a % b)
 
 
+def _min(a, b):
+    return arith.select(a < b, a, b)
+
+
+def xcd_swizzle(num_pid_m, num_pid_n):
+    NUM_XCDS = 8
+    WGM = 4
+    NUM_CUS = 32 * NUM_XCDS
+    SWIZZLE_THRESHOLD = 4 * NUM_CUS
+
+    wgid = fx.block_idx.x
+
+    num_wg = num_pid_m * num_pid_n
+
+    # Simple path: no XCD remapping.
+    simple_m, simple_n = divmod(wgid, num_pid_n)
+
+    # XCD-remapped path.
+    intra_xcd, xcd = divmod(wgid, NUM_XCDS)
+    wgid_remap = xcd * (num_wg // NUM_XCDS) + intra_xcd
+    num_wgid_in_group = WGM * num_pid_n
+    group_id, intra_group = divmod(wgid_remap, num_wgid_in_group)
+    first_pid_m = group_id * WGM
+    group_size_m = _min(num_pid_m - first_pid_m, WGM)
+    pid_n, intra_group_m = divmod(intra_group, group_size_m)
+    pid_m = first_pid_m + intra_group_m
+
+    use_simple = (num_wg <= SWIZZLE_THRESHOLD) | (num_wg % NUM_XCDS != 0)
+    return (arith.select(use_simple, simple_m, pid_m), arith.select(use_simple, simple_n, pid_n))
+
+
 def make_fp8_buffer_tensor(arg_i8, fp8_ir_t):
     # max_size=False with no num_records_bytes: cosize(layout) becomes a
     # runtime expression because TensorAdaptor defaults to layout-dynamic
@@ -198,7 +229,7 @@ def wait_barrier(count):
     _llvm.inline_asm(
         res=None,
         operands_=[],
-        asm_string=f"s_waitcnt vmcnt({count})\ns_barrier",
+        asm_string=f"s_waitcnt vmcnt({count})\n\ts_barrier",
         constraints="",
         has_side_effects=True,
     )

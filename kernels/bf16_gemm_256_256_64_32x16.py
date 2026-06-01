@@ -3,14 +3,15 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import buffer_ops, range_constexpr, rocdl
+from flydsl.expr import buffer_ops, const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
-from kernels.fp8_gemm_utils import ceildiv, divmod, wait_barrier
+from kernels.fp8_gemm_utils import ceildiv, divmod, wait_barrier, xcd_swizzle
 
 
-def compile_bf16_gemm(
+def compile_bf16_gemm_32x16(
     *,
-    K: int
+    K: int,
+    use_xcd_remap: bool = False
 ):
     # 256x256x64
     BLOCK_SIZE = 256
@@ -63,9 +64,12 @@ def compile_bf16_gemm(
         lane_id = fx.thread_idx.x % 64
         wave_id = fx.thread_idx.x // 64
 
-        # This tile (C) row, col
-        row, col = divmod(fx.block_idx.x, ceildiv(c_n, BLOCK_SIZE))
-        # The row, col of the sub-tile for this wave
+        n_blocks = ceildiv(c_n, BLOCK_SIZE)
+        if const_expr(use_xcd_remap):
+            row, col = xcd_swizzle(ceildiv(c_m, BLOCK_SIZE), n_blocks)
+        else:
+            row, col = divmod(fx.block_idx.x, n_blocks)
+
         wave_row, wave_col = divmod(wave_id, 4)
 
         A_gl_offset = row * BLOCK_SIZE * K * 2
@@ -204,6 +208,9 @@ def compile_bf16_gemm(
         _load_lds(B_rsrc, B_lds[cur], B_gl_offset + 0 * BLOCK_K * 2, gl_offsets)
         wait_barrier(0)
 
+        if wave_row == 1:
+            rocdl.s_barrier()
+
         for k in range_constexpr(K_ITERS - 1):
             a_frag = _load_A_rt(A_lds[cur], wave_row, k_offset=0)
             _load_lds(A_rsrc, A_lds[next], A_gl_offset + (k + 1) * BLOCK_K * 2, gl_offsets)
@@ -266,7 +273,7 @@ def compile_bf16_gemm(
             C,
             c_m,
             c_n,
-            value_attrs={"rocdl.waves_per_eu": 2},
+            value_attrs={"rocdl.waves_per_eu": 2, "rocdl.flat_work_group_size": "512,512"},
         ).launch(grid=(grid_x, 1, 1), block=(512, 1, 1), stream=stream)
 
     return launch_gemm

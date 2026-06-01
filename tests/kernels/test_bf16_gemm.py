@@ -22,7 +22,8 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from kernels.bf16_gemm import compile_bf16_gemm  # noqa: E402
+from kernels.bf16_gemm_256_256_64_32x16 import compile_bf16_gemm_32x16  # noqa: E402
+from kernels.bf16_gemm_256_256_64_16x32 import compile_bf16_gemm_16x32  # noqa: E402
 from tests.test_common import run_perftest, verify_output  # noqa: E402
 
 if not torch.cuda.is_available():
@@ -46,6 +47,7 @@ def _bench_bf16_gemm(
     *,
     num_warmups: int = DEFAULT_BENCH_WARMUP,
     num_iters: int = DEFAULT_BENCH_ITERS,
+    use_32x16: bool = False,
 ):
     device = torch.device("cuda")
 
@@ -59,8 +61,12 @@ def _bench_bf16_gemm(
 
     c_ref_f32 = _run_torch(a, b_t)
 
-    launch_fn = compile_bf16_gemm(K=K)
-    print(f"\n[bf16_gemm] M={M} N={N} K={K}")
+    if use_32x16:
+        launch_fn = compile_bf16_gemm_32x16(K=K)
+        print(f"\n[bf16_gemm 32x16] M={M} N={N} K={K}")
+    else:
+        launch_fn = compile_bf16_gemm_16x32(K=K)
+        print(f"\n[bf16_gemm 16x32] M={M} N={N} K={K}")
 
     def _args(c, a_, b_):
         return (
@@ -108,9 +114,13 @@ if __name__ == "__main__":
     parser.add_argument("-K", type=int, default=4096)
     parser.add_argument("--num_iters", type=int, default=DEFAULT_BENCH_ITERS)
     parser.add_argument("--num_warmups", type=int, default=DEFAULT_BENCH_WARMUP)
+    parser.add_argument("--use_32x16", action="store_true")
     args = parser.parse_args()
 
     torch.set_default_device("cuda")
+
+    # for s in [1024, 2048, 4096, 8192, 16384]:
+    #     _bench_bf16_gemm(s, s, s, num_warmups=DEFAULT_BENCH_WARMUP, num_iters=DEFAULT_BENCH_ITERS)
 
     try:
         _bench_bf16_gemm(
@@ -119,6 +129,7 @@ if __name__ == "__main__":
             K=args.K,
             num_warmups=args.num_warmups,
             num_iters=args.num_iters,
+            use_32x16=args.use_32x16
         )
     except pytest.skip.Exception as e:
         print(f"Skipped: {e}")
