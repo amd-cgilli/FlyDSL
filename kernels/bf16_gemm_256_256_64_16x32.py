@@ -184,22 +184,23 @@ def compile_bf16_gemm_16x32(
                         )
             return c
 
-        def _store_rt(row_idx, col_idx):
-            base_row = row * BLOCK_SIZE + row_idx * HALF_BLOCK_SIZE + wave_row * 64
-            base_col = col * BLOCK_SIZE + col_idx * HALF_BLOCK_SIZE + wave_col * 32
-
-            this_frag = c_frag[row_idx][col_idx]
-            for i in range_constexpr(4):
-                row_offset = i * 16
-                for j in range_constexpr(2):
-                    col_offset = j * 16
-                    v_bf16 = this_frag[i][j].to(fx.BFloat16)
-                    r = base_row + row_offset + (lane_id // 16) * 4
-                    c = base_col + col_offset + lane_id % 16
-                    for el_idx in range_constexpr(4):
-                        buffer_ops.buffer_store(
-                            v_bf16[el_idx], C_rsrc, fx.Int32((r + el_idx) * c_n + c)
-                        )
+        def _store_rt():
+            for row_idx in range_constexpr(2):
+                base_row = row * BLOCK_SIZE + row_idx * HALF_BLOCK_SIZE + wave_row * 64
+                for col_idx in range_constexpr(2):
+                    base_col = col * BLOCK_SIZE + col_idx * HALF_BLOCK_SIZE + wave_col * 32
+                    this_frag = c_frag[row_idx][col_idx]
+                    for i in range_constexpr(4):
+                        row_offset = i * 16
+                        for j in range_constexpr(2):
+                            col_offset = j * 16
+                            v_bf16 = this_frag[i][j].to(fx.BFloat16)
+                            r = base_row + row_offset + (lane_id // 16) * 4
+                            c = base_col + col_offset + lane_id % 16
+                            for el_idx in range_constexpr(4):
+                                buffer_ops.buffer_store(
+                                    v_bf16[el_idx], C_rsrc, fx.Int32((r + el_idx) * c_n + c)
+                                )
 
         gl_offsets = _precompute_global_swizzle()
         cur, next = 0, 1
@@ -361,10 +362,7 @@ def compile_bf16_gemm_16x32(
         if wave_row == 0:
             rocdl.s_barrier()
 
-        _store_rt(0, 0)
-        _store_rt(0, 1)
-        _store_rt(1, 0)
-        _store_rt(1, 1)
+        _store_rt()
 
     @flyc.jit
     def launch_gemm(
