@@ -13,6 +13,7 @@ import sys
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 import flydsl.compiler as flyc
 
@@ -30,8 +31,8 @@ if not torch.cuda.is_available():
     pytest.skip("CUDA/ROCm not available. Skipping GPU tests.", allow_module_level=True)
 
 
-DEFAULT_BENCH_ITERS = 100
-DEFAULT_BENCH_WARMUP = 20
+DEFAULT_BENCH_ITERS = 200
+DEFAULT_BENCH_WARMUP = 100
 
 
 def _run_torch(a, b_t, dtype=torch.float32):
@@ -39,6 +40,21 @@ def _run_torch(a, b_t, dtype=torch.float32):
     c = torch.mm(a.to(torch.float32), b_t.to(torch.float32).T)
     return c.to(dtype)
 
+def _bench_torch(a, b, num_warmups, num_iters) -> float:
+    m, _ = a.shape
+    n, _ = b.shape
+    out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
+
+    def _launch(_out):
+        F.linear(a, b, out=_out)
+
+    _, us = run_perftest(_launch, out, num_iters=num_iters, num_warmup=num_warmups)
+    torch.cuda.synchronize()
+    return us
+
+def tflops(m, n, k, us):
+    flops = 2 * m * n * k
+    return flops / (us / 1e6) / 1e12
 
 def _bench_bf16_gemm(
     M: int,
@@ -48,6 +64,7 @@ def _bench_bf16_gemm(
     num_warmups: int = DEFAULT_BENCH_WARMUP,
     num_iters: int = DEFAULT_BENCH_ITERS,
     use_32x16: bool = False,
+    vs_torch: bool = False,
 ):
     device = torch.device("cuda")
 
@@ -84,7 +101,7 @@ def _bench_bf16_gemm(
         compiled(*_args(c, a_, b_))
 
     num_iters = max(2, int(num_iters))
-    _, us = run_perftest(
+    _, us_fly = run_perftest(
         _launch,
         c_out,
         a,
@@ -96,13 +113,13 @@ def _bench_bf16_gemm(
 
     assert verify_output(c_out.to(torch.float32), c_ref_f32, rtol=0.1, atol=0.1)
 
-    flops = 2 * M * N * K
-    bytes_moved = (M * K * 2) + (N * K * 2) + (M * N * 4)
-    tflops = flops / (us / 1e6) / 1e12
-    tbps = bytes_moved / 1e12 / (us / 1e6)
-    print(f"[flyc] Throughput: {us:.1f} us, {tflops:.2f} TFLOPS, BW: {tbps:.3f} TB/s")
+    tflops_fly = tflops(M, N, K, us_fly)
+    print(f"[FLYDSL] Throughput: {us_fly:.1f} us, {tflops_fly:.2f} TFLOPS")
 
-    return tflops
+    if vs_torch:
+        us_torch = _bench_torch(a, b_t, num_warmups=num_warmups, num_iters=num_iters)
+        tflops_torch = tflops(M, N, K, us_torch)
+        print(f"[PyTorch] Throughput: {us_torch:.1f} us, {tflops_torch:.2f} TFLOPS")
 
 
 if __name__ == "__main__":
@@ -115,6 +132,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_iters", type=int, default=DEFAULT_BENCH_ITERS)
     parser.add_argument("--num_warmups", type=int, default=DEFAULT_BENCH_WARMUP)
     parser.add_argument("--use_32x16", action="store_true")
+    parser.add_argument("--vs_torch", action="store_true")
     args = parser.parse_args()
 
     torch.set_default_device("cuda")
@@ -129,7 +147,8 @@ if __name__ == "__main__":
             K=args.K,
             num_warmups=args.num_warmups,
             num_iters=args.num_iters,
-            use_32x16=args.use_32x16
+            use_32x16=args.use_32x16,
+            vs_torch=args.vs_torch
         )
     except pytest.skip.Exception as e:
         print(f"Skipped: {e}")
