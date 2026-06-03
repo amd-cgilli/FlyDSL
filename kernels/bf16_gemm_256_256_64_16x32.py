@@ -44,14 +44,13 @@ def compile_bf16_gemm_16x32(
         Accum_t = Vec.make_type(4, fx.Float32)
         Accum_zero = Vec.filled(4, 0.0, fx.Float32)
 
-        # 64x32
-        c_frag_base = [
-            [Accum_zero for _ in range_constexpr(2)]
-            for _ in range_constexpr(4)
-        ]
-        # 64x32 in a 2x2 config -> 128x64
+        # Each quadrant is 64x32 (4 row-tiles x 2 col-tiles of 16x16 MFMA atoms)
+        # 2x2 quadrants -> 128x64 per wave
         c_frag = [
-            [c_frag_base for _ in range_constexpr(2)]
+            [
+                [[Accum_zero for _ in range_constexpr(2)] for _ in range_constexpr(4)]
+                for _ in range_constexpr(2)
+            ]
             for _ in range_constexpr(2)
         ]
 
@@ -186,14 +185,14 @@ def compile_bf16_gemm_16x32(
             return c
 
         def _store_rt(row_idx, col_idx):
-            base_row = row * BLOCK_SIZE + wave_row * (BLOCK_SIZE // 2) + row_idx * 64
-            base_col = col * BLOCK_SIZE + wave_col * (BLOCK_SIZE // 4) + col_idx * 32
+            base_row = row * BLOCK_SIZE + row_idx * HALF_BLOCK_SIZE + wave_row * 64
+            base_col = col * BLOCK_SIZE + col_idx * HALF_BLOCK_SIZE + wave_col * 32
 
             this_frag = c_frag[row_idx][col_idx]
             for i in range_constexpr(4):
-                row_offset = i * 32
+                row_offset = i * 16
                 for j in range_constexpr(2):
-                    col_offset = j * 32
+                    col_offset = j * 16
                     v_bf16 = this_frag[i][j].to(fx.BFloat16)
                     r = base_row + row_offset + (lane_id // 16) * 4
                     c = base_col + col_offset + lane_id % 16
@@ -227,17 +226,140 @@ def compile_bf16_gemm_16x32(
             # Each step of the main loop handles tile 2k and 2k+1
             k = 2*k2
             b0_frag = _load_B_rt(B_lds[0][0], wave_col)
-            a0_frag = _load_A_rt(A_lds[0][0], wave_row)
+            a_frag = _load_A_rt(A_lds[0][0], wave_row)
 
             _load_lds(A_rsrc, A_lds[1][1], A128_gl_offset + (k + 1) * BLOCK_K * 2, gl_offsets)
             rocdl.s_barrier()
 
             rocdl.s_setprio(1)
-            c_frag = _mfma(a0_frag, b0_frag, c_frag[0][0])
+            c_frag[0][0] = _mfma(a_frag, b0_frag, c_frag[0][0])
             rocdl.s_setprio(0)
             rocdl.s_barrier()
-            # TODO: impl...
 
+            b1_frag = _load_B_rt(B_lds[0][1], wave_col)
+            _load_lds(B_rsrc, B_lds[0][0], B0_gl_offset + (k + 2) * BLOCK_K * 2, gl_offsets)
+            rocdl.s_barrier()
+
+            rocdl.s_setprio(1)
+            c_frag[0][1] = _mfma(a_frag, b1_frag, c_frag[0][1])
+            rocdl.s_setprio(0)
+            rocdl.s_barrier()
+
+            a_frag = _load_A_rt(A_lds[0][1], wave_row)
+            _load_lds(A_rsrc, A_lds[0][0], A0_gl_offset + (k + 2) * BLOCK_K * 2, gl_offsets)
+            rocdl.s_barrier()
+
+            rocdl.s_setprio(1)
+            c_frag[1][0] = _mfma(a_frag, b0_frag, c_frag[1][0])
+            rocdl.s_setprio(0)
+            rocdl.s_barrier()
+
+            b0_frag = _load_B_rt(B_lds[1][0], wave_col)
+            _load_lds(B_rsrc, B_lds[0][1], B128_gl_offset + (k + 2) * BLOCK_K * 2, gl_offsets)
+            wait_barrier(6)
+
+            rocdl.s_setprio(1)
+            c_frag[1][1] = _mfma(a_frag, b1_frag, c_frag[1][1])
+            rocdl.s_setprio(0)
+            rocdl.s_barrier()
+
+            a_frag = _load_A_rt(A_lds[1][0], wave_row)
+            _load_lds(A_rsrc, A_lds[0][1], A128_gl_offset + (k + 2) * BLOCK_K * 2, gl_offsets)
+            rocdl.s_barrier()
+
+            rocdl.s_setprio(1)
+            c_frag[0][0] = _mfma(a_frag, b0_frag, c_frag[0][0])
+            rocdl.s_setprio(0)
+            rocdl.s_barrier()
+
+            b1_frag = _load_B_rt(B_lds[1][1], wave_col)
+            _load_lds(B_rsrc, B_lds[1][0], B0_gl_offset + (k + 3) * BLOCK_K * 2, gl_offsets)
+            rocdl.s_barrier()
+
+            rocdl.s_setprio(1)
+            c_frag[0][1] = _mfma(a_frag, b1_frag, c_frag[0][1])
+            rocdl.s_setprio(0)
+            rocdl.s_barrier()
+
+            a_frag = _load_A_rt(A_lds[1][1], wave_row)
+            _load_lds(A_rsrc, A_lds[1][0], A0_gl_offset + (k + 3) * BLOCK_K * 2, gl_offsets)
+            rocdl.s_barrier()
+
+            rocdl.s_setprio(1)
+            c_frag[1][0] = _mfma(a_frag, b0_frag, c_frag[1][0])
+            rocdl.s_setprio(0)
+            rocdl.s_barrier()
+
+            _load_lds(B_rsrc, B_lds[1][1], B128_gl_offset + (k + 3) * BLOCK_K * 2, gl_offsets)
+            wait_barrier(6)
+
+            rocdl.s_setprio(1)
+            c_frag[1][1] = _mfma(a_frag, b1_frag, c_frag[1][1])
+            rocdl.s_setprio(0)
+            rocdl.s_barrier()
+
+        # Epilogue
+        # k = num_iters - 2
+        k = NUM_TILES - 2
+        b0_frag = _load_B_rt(B_lds[cur][0], wave_col)
+        a_frag = _load_A_rt(A_lds[cur][0], wave_row)
+        _load_lds(A_rsrc, A_lds[next][1], A128_gl_offset + (k + 1) * BLOCK_K * 2, gl_offsets)
+        rocdl.s_barrier()
+
+        rocdl.s_setprio(1)
+        c_frag[0][0] = _mfma(a_frag, b0_frag, c_frag[0][0])
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+
+        b1_frag = _load_B_rt(B_lds[cur][1], wave_col)
+        rocdl.s_barrier()
+
+        rocdl.s_setprio(1)
+        c_frag[0][1] = _mfma(a_frag, b1_frag, c_frag[0][1])
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+
+        a_frag = _load_A_rt(A_lds[cur][1], wave_row)
+        wait_barrier(4)
+
+        rocdl.s_setprio(1)
+        c_frag[1][0] = _mfma(a_frag, b0_frag, c_frag[1][0])
+        c_frag[1][1] = _mfma(a_frag, b1_frag, c_frag[1][1])
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+
+        cur ^= 1
+        next ^= 1
+
+        # k = num_iters - 1
+        b0_frag = _load_B_rt(B_lds[cur][0], wave_col)
+        a_frag = _load_A_rt(A_lds[cur][0], wave_row)
+        wait_barrier(2)
+
+        rocdl.s_setprio(1)
+        c_frag[0][0] = _mfma(a_frag, b0_frag, c_frag[0][0])
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+
+        b1_frag = _load_B_rt(B_lds[cur][1], wave_col)
+        wait_barrier(0)
+
+        rocdl.s_setprio(1)
+        c_frag[0][1] = _mfma(a_frag, b1_frag, c_frag[0][1])
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+
+        a_frag = _load_A_rt(A_lds[cur][1], wave_row)
+        rocdl.s_barrier()
+
+        rocdl.s_setprio(1)
+        c_frag[1][0] = _mfma(a_frag, b0_frag, c_frag[1][0])
+        c_frag[1][1] = _mfma(a_frag, b1_frag, c_frag[1][1])
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+
+        if wave_row == 0:
+            rocdl.s_barrier()
 
         _store_rt(0, 0)
         _store_rt(0, 1)
