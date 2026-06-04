@@ -25,6 +25,7 @@ if _REPO_ROOT not in sys.path:
 
 from kernels.bf16_gemm_256_256_64_32x16 import compile_bf16_gemm_32x16  # noqa: E402
 from kernels.bf16_gemm_256_256_64_16x32 import compile_bf16_gemm_16x32  # noqa: E402
+from kernels.bf16_gemm_256_256_64_16x32_4w import compile_bf16_gemm_16x32_4w  # noqa: E402
 from tests.test_common import run_perftest, verify_output  # noqa: E402
 
 if not torch.cuda.is_available():
@@ -64,6 +65,7 @@ def _bench_bf16_gemm(
     num_warmups: int = DEFAULT_BENCH_WARMUP,
     num_iters: int = DEFAULT_BENCH_ITERS,
     use_32x16: bool = False,
+    use_4wave: bool = False,
     vs_torch: bool = False,
 ):
     device = torch.device("cuda")
@@ -78,12 +80,17 @@ def _bench_bf16_gemm(
 
     c_ref_f32 = _run_torch(a, b_t)
 
-    if use_32x16:
-        launch_fn = compile_bf16_gemm_32x16(K=K)
-        print(f"\n[bf16_gemm 32x16] M={M} N={N} K={K}")
+    if use_4wave:
+        launch_fn = compile_bf16_gemm_16x32_4w(K=K)
+        print(f'\n[bf16_gemm 16x32 4Wave] M={M} N={N} K={K}')
     else:
-        launch_fn = compile_bf16_gemm_16x32(K=K)
-        print(f"\n[bf16_gemm 16x32] M={M} N={N} K={K}")
+        if use_32x16:
+            launch_fn = compile_bf16_gemm_32x16(K=K)
+            print(f"\n[bf16_gemm 32x16] M={M} N={N} K={K}")
+        else:
+            launch_fn = compile_bf16_gemm_16x32(K=K)
+            print(f"\n[bf16_gemm 16x32] M={M} N={N} K={K}")
+
 
     def _args(c, a_, b_):
         return (
@@ -132,6 +139,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_iters", type=int, default=DEFAULT_BENCH_ITERS)
     parser.add_argument("--num_warmups", type=int, default=DEFAULT_BENCH_WARMUP)
     parser.add_argument("--use_32x16", action="store_true")
+    parser.add_argument("--use_4w", action="store_true")
     parser.add_argument("--vs_torch", action="store_true")
     args = parser.parse_args()
 
@@ -148,7 +156,8 @@ if __name__ == "__main__":
             num_warmups=args.num_warmups,
             num_iters=args.num_iters,
             use_32x16=args.use_32x16,
-            vs_torch=args.vs_torch
+            vs_torch=args.vs_torch,
+            use_4wave=args.use_4w
         )
     except pytest.skip.Exception as e:
         print(f"Skipped: {e}")
