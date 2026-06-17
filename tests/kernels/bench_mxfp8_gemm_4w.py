@@ -131,7 +131,86 @@ def mxfp8_dequantize(q: torch.Tensor, e8m0: torch.Tensor) -> torch.Tensor:
     return (qf * scale.unsqueeze(-1)).reshape(dim, k)
 
 
+def preshuffle_scales(scale: torch.Tensor, group: int) -> torch.Tensor:
+    """Preshuffle [dim, K//32] uint8 E8M0 scales into the packed uint32 layout the
+    GEMM loads with a single int32 read: [ceil(dim/group), 16, K//32] uint32.
+
+    ``group`` is the number of M/N rows one wave-fragment covers (= BLOCK//4 =
+    N_TILES*16). The kernel reads a fragment whose first global row is a multiple
+    of ``group`` as one uint32 holding the N_TILES sub-row scales
+    {frag_base + g*16 + r16 : g in 0..N_TILES-1} little-endian, with byte g
+    selected by the scaled-MFMA opsel. Bytes beyond N_TILES (when N_TILES < 4)
+    are never read; they and partial-group padding rows hold the E8M0 identity
+    0x7F (= 2**0 = 1.0) so every load is a full, in-bounds int32.
+    """
+    assert group % 16 == 0
+    n_tiles = group // 16
+    dim, scale_k = scale.shape
+    groups = (dim + group - 1) // group
+    padded_dim = groups * group
+    if padded_dim != dim:
+        pad = torch.full(
+            (padded_dim - dim, scale_k), 0x7F, dtype=scale.dtype, device=scale.device
+        )
+        scale = torch.cat([scale, pad], dim=0)
+    s = scale.reshape(groups, n_tiles, 16, scale_k)  # [grp, g, r16, col]
+    s = s.permute(0, 2, 3, 1).contiguous()  # [grp, r16, col, g]
+    if n_tiles < 4:  # pad each word out to a full uint32 with identity bytes
+        wpad = torch.full(
+            (groups, 16, scale_k, 4 - n_tiles), 0x7F, dtype=s.dtype, device=s.device
+        )
+        s = torch.cat([s, wpad], dim=-1).contiguous()
+    return s.view(torch.int32).reshape(groups, 16, scale_k)  # little-endian uint32
+
+
+# Block sizes to autotune over for both M and N.
+BLOCK_CHOICES = [64, 128, 256]
+# Set to see why each (block_m, block_n) config is skipped during the sweep.
+VERBOSE_AUTOTUNE = bool(int(os.environ.get("VERBOSE_AUTOTUNE", "0")))
+
+
+def config_name(block_m, block_n):
+    return f"4w_{block_m}x{block_n}x{BLOCK_K}"
+
+
+def _make_config_runner(block_m, block_n, K, x_q, w_q, x_scale, w_scale, M, N):
+    """Build the run closure for one (block_m, block_n) config. Each config needs
+    its own group-specific preshuffled scales, compiled kernel, and output
+    buffer. Returns (run, c_out)."""
+    device = x_q.device
+    # Preshuffled E8M0 scales [ceil(dim/group), 16, K//32] uint32, packed host-side
+    # so the GEMM loads each scale word with a single padded int32 read. The wave
+    # fragment covers BLOCK//4 rows, which is the scale-pack group size.
+    sa = preshuffle_scales(x_scale.contiguous(), block_m // 4)  # [ceil(M/(BM//4)), 16, K//32]
+    sb = preshuffle_scales(w_scale.contiguous(), block_n // 4)  # [ceil(N/(BN//4)), 16, K//32]
+
+    c_out = torch.empty((M, N), dtype=torch.bfloat16, device=device)
+    stream = torch.cuda.current_stream()
+
+    def _gemm_args():
+        return (
+            x_q.view(-1),
+            w_q.view(-1),
+            c_out.view(-1),
+            sa.reshape(-1),
+            sb.reshape(-1),
+            M, N,
+            stream,
+        )
+
+    launch_gemm = compile_mxfp8_gemm_4w(K=K, BLOCK_M=block_m, BLOCK_N=block_n)
+    gemm = flyc.compile(launch_gemm, *_gemm_args())
+
+    def run():
+        gemm(*_gemm_args())
+
+    return run, c_out
+
+
 def make_runner(M, N, K, x_dtype):
+    """Autotune over all (block_m, block_n) configs: verify each against the
+    Triton reference, benchmark the correct ones, and return
+    (best_run, run_triton, best_config_name) for the fastest passing config."""
     assert K % BLOCK_K == 0
     device = "cuda"
 
@@ -142,46 +221,43 @@ def make_runner(M, N, K, x_dtype):
     w_q, w_scale = mxfp8_e4m3_quantize(w)  # [N,K] fp8, [N,K//32] u8
     x_q, w_q = x_q.contiguous(), w_q.contiguous()
 
-    # Unpacked E8M0 (uint8) block scales [dim, K//32] consumed directly by the
-    # GEMM; the kernel now gathers and packs the 4 MFMA scale bytes on-device, so
-    # no pre-pack pass and no row padding is needed.
-    sa = x_scale.contiguous()  # [M, K//32]
-    sb = w_scale.contiguous()  # [N, K//32]
-
-    c_out = torch.empty((M, N), dtype=torch.bfloat16, device=device)
-
-    launch_gemm = compile_mxfp8_gemm_4w(K=K)
-    stream = torch.cuda.current_stream()
-
-    def _gemm_args():
-        return (
-            x_q.view(-1),
-            w_q.view(-1),
-            c_out.view(-1),
-            sa,
-            sb,
-            M, N,
-            stream,
-        )
-
-    gemm = flyc.compile(launch_gemm, *_gemm_args())
-
-    def run():
-        gemm(*_gemm_args())
-
     # Reference from the Triton tl.dot_scaled kernel on the *same* quantized
     # fp8 inputs + E8M0 scales the GEMM consumes.
-    c_ref = triton_mxfp8_reference(x_q, x_scale, w_q, w_scale, M, N, K)
+    c_ref = triton_mxfp8_reference(x_q, x_scale, w_q, w_scale, M, N, K).to(torch.float32)
 
     def run_triton():
         triton_mxfp8_reference(x_q, x_scale, w_q, w_scale, M, N, K)
 
-    # Verify accuracy before handing back the benchmark closure.
-    run()
-    torch.cuda.synchronize()
-    assert verify_output(c_out.to(torch.float32), c_ref.to(torch.float32), atol=0.1, rtol=0.1)
+    best_run = None
+    best_name = None
+    best_us = float("inf")
+    for block_m in BLOCK_CHOICES:
+        for block_n in BLOCK_CHOICES:
+            name = config_name(block_m, block_n)
+            try:
+                run, c_out = _make_config_runner(
+                    block_m, block_n, K, x_q, w_q, x_scale, w_scale, M, N
+                )
+                run()
+                torch.cuda.synchronize()
+            except Exception as e:
+                if VERBOSE_AUTOTUNE:
+                    print(f"    [{name}] compile/run error: {e}")
+                continue
+            if not verify_output(c_out.to(torch.float32), c_ref, atol=0.1, rtol=0.1):
+                if VERBOSE_AUTOTUNE:
+                    print(f"    [{name}] failed correctness check")
+                continue
+            us = triton.testing.do_bench(run) * 1e3
+            if VERBOSE_AUTOTUNE:
+                print(f"    [{name}] ok, {us:.2f} us")
+            if us < best_us:
+                best_us, best_run, best_name = us, run, name
 
-    return run, run_triton
+    if best_run is None:
+        raise AssertionError("no config passed the correctness check")
+
+    return best_run, run_triton, best_name
 
 
 # (m, n, k) shapes to sweep.
@@ -243,15 +319,15 @@ SHAPES = [
 
 if __name__ == "__main__":
     header = (
-        f"{'shape (MxNxK)':>18} {'dtype':>10} {'latency FlyDSL(us)':>20} {'TFLOPS FlyDSL':>15}"
-        f" {'latency Triton(us)':>20} {'TFLOPS Triton':>15}"
+        f"{'shape (MxNxK)':>18} {'best config':>16} {'latency FlyDSL(us)':>20} {'TFLOPS FlyDSL':>15}"
+        f" {'latency Triton(us)':>20} {'TFLOPS Triton':>15} {'Speedup':>10}"
     )
     print(header)
 
     failed = []
     for M, N, K in SHAPES:
         try:
-            run, run_triton = make_runner(M, N, K, torch.bfloat16)
+            run, run_triton, best_config = make_runner(M, N, K, torch.bfloat16)
         except AssertionError:
             failed.append((M, N, K))
             continue
@@ -264,9 +340,10 @@ if __name__ == "__main__":
         us_tt = triton.testing.do_bench(run_triton) * 1e3
         tflops_tt = flops / (us_tt * 1e-6) / 1e12
 
+        speedup = us_tt / us
         print(
-            f"{f'{M}x{N}x{K}':>18} {'bfloat16':>10} {us:>20.2f} {tflops:>15.2f}"
-            f" {us_tt:>20.2f} {tflops_tt:>15.2f}"
+            f"{f'{M}x{N}x{K}':>18} {best_config:>16} {us:>20.2f} {tflops:>15.2f}"
+            f" {us_tt:>20.2f} {tflops_tt:>15.2f} {speedup:>10.2f}x"
         )
 
     if failed:
