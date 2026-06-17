@@ -1,22 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Standalone benchmark / smoke test for the 4-wave interleaved MXFP8 GEMM.
 
-Builds inputs the same way as ``bench_mxfp8_linear_standalone`` (MXFP8 E4M3
-quantization with E8M0 block scales), compiles both the GEMM and the
-scale-repack launchers from ``kernels.mxfp8_gemm_4w`` with ``flyc.compile``,
-then times the GEMM with ``triton.testing.do_bench``.
-
-Run with the default M=N=K=8192:
-
-    python3 tests/kernels/bench_mxfp8_gemm_4w.py
-"""
-
-import argparse
 import os
 import sys
 
 import torch
 import triton
+import triton.language as tl
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if _REPO_ROOT not in sys.path:
@@ -32,16 +21,105 @@ FP8_DTYPE = torch.float8_e4m3fn
 SCALE_DTYPE = torch.uint8
 
 
+@triton.jit
+def _mxfp8_linear_kernel(
+    x_ptr,
+    xs_ptr,
+    w_ptr,
+    ws_ptr,
+    out_ptr,
+    M,
+    N,
+    K,
+    stride_xm,
+    stride_xk,
+    stride_xsm,
+    stride_xsk,
+    stride_wn,
+    stride_wk,
+    stride_wsn,
+    stride_wsk,
+    stride_om,
+    stride_on,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_sk = tl.arange(0, BLOCK_K // 32)
+    m_mask = offs_m < M
+    n_mask = offs_n < N
+
+    x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+    xs_ptrs = xs_ptr + offs_m[:, None] * stride_xsm + offs_sk[None, :] * stride_xsk
+    w_ptrs = w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
+    ws_ptrs = ws_ptr + offs_n[:, None] * stride_wsn + offs_sk[None, :] * stride_wsk
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for _ in range(0, tl.cdiv(K, BLOCK_K)):
+        x = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0)
+        w = tl.load(w_ptrs, mask=n_mask[:, None], other=0.0)
+        xs = tl.load(xs_ptrs, mask=m_mask[:, None], other=0)
+        ws = tl.load(ws_ptrs, mask=n_mask[:, None], other=0)
+        acc += tl.dot_scaled(x, xs, "e4m3", w.T, ws, "e4m3")
+        x_ptrs += BLOCK_K * stride_xk
+        w_ptrs += BLOCK_K * stride_wk
+        xs_ptrs += (BLOCK_K // 32) * stride_xsk
+        ws_ptrs += (BLOCK_K // 32) * stride_wsk
+
+    o_ptrs = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+    tl.store(
+        o_ptrs, acc.to(out_ptr.dtype.element_ty), mask=m_mask[:, None] & n_mask[None, :]
+    )
+
+
+def triton_mxfp8_reference(x_q, x_scale, w_q, w_scale, M, N, K):
+    """Reference output via the Triton ``tl.dot_scaled`` MXFP8 GEMM, fed the same
+    quantized fp8 values + E8M0 scales the FlyDSL kernel consumes."""
+    x_q, x_scale = x_q.contiguous(), x_scale.contiguous()
+    w_q, w_scale = w_q.contiguous(), w_scale.contiguous()
+    out = torch.empty((M, N), dtype=torch.bfloat16, device=x_q.device)
+
+    if M >= 1024:
+        BLOCK_M, BLOCK_N, num_warps, num_stages = 128, 256, 8, 2
+    else:
+        BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 64, 4, 2
+
+    BLOCK_K = 128
+
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    _mxfp8_linear_kernel[grid](
+        x_q, x_scale, w_q, w_scale, out, M, N, K,
+        x_q.stride(0), x_q.stride(1),
+        x_scale.stride(0), x_scale.stride(1),
+        w_q.stride(0), w_q.stride(1),
+        w_scale.stride(0), w_scale.stride(1),
+        out.stride(0), out.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+    return out
+
+
 def mxfp8_e4m3_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize ``x`` [..., K] to FP8 E4M3 values + E8M0 (uint8) block scales."""
+    """Quantize ``x`` [..., K] to FP8 E4M3 values + E8M0 (uint8) block scales.
+
+    Matches HipKittens ``compute_e8m0_scale``: the stored exponent is
+    ``clamp(floor(log2(amax)) + 127, 0, 254)`` so each block's max lands in
+    ``[1, 2)`` and never reaches the E4M3 NaN cliff at 448.
+    """
     assert x.shape[-1] % MXFP8_BLOCK_SIZE == 0
     orig_shape = x.shape
     xb = x.reshape(*orig_shape[:-1], orig_shape[-1] // MXFP8_BLOCK_SIZE, MXFP8_BLOCK_SIZE)
-    amax = xb.abs().amax(dim=-1)
-    amax = torch.where(amax == 0, torch.ones_like(amax), amax)
-    scale_exp = (torch.floor(torch.log2(amax)) - 8.0).clamp(-127, 128)
-    e8m0 = (scale_exp + 127.0).to(torch.int32).to(SCALE_DTYPE)
-    q = (xb * torch.exp2(-scale_exp).unsqueeze(-1)).to(FP8_DTYPE)
+    amax = xb.abs().amax(dim=-1).to(torch.float32)
+    # floor(log2(0)) == -inf; the clamp below maps that to a stored exponent of 0.
+    e8m0 = (torch.floor(torch.log2(amax)) + 127.0).clamp(0, 254).to(torch.int32).to(SCALE_DTYPE)
+    inv = torch.exp2(127.0 - e8m0.to(torch.float32))  # ldexp(1, 127 - s)
+    q = (xb * inv.unsqueeze(-1)).to(FP8_DTYPE)
     return q.reshape(orig_shape), e8m0
 
 
@@ -64,7 +142,23 @@ def pack_scales_iter_major(scale_raw: torch.Tensor, k_iters: int) -> torch.Tenso
     s = scale_raw.to(torch.int64).reshape(dim, k_iters, 4)
     shift = torch.arange(4, device=s.device, dtype=torch.int64) * 8
     packed = (s << shift).sum(dim=-1)  # [dim, k_iters]
-    return packed.t().contiguous().to(torch.int32)  # [k_iters, dim]
+    return packed.t().contiguous().to(torch.uint32)  # [k_iters, dim]
+
+
+def _pad_scale_rows(scale_iter: torch.Tensor, padded_dim: int) -> torch.Tensor:
+    """Pad [k_iters, dim] packed-uint32 scales out to ``padded_dim`` rows.
+
+    Padding rows hold 0x7F7F7F7F, the packed E8M0 identity scale (four bytes of
+    exponent 127 = 2**0 = 1.0), so out-of-range rows of a partial tile contribute
+    a scale of 1.0.
+    """
+    k_iters, dim = scale_iter.shape
+    if padded_dim == dim:
+        return scale_iter
+    pad = torch.full(
+        (k_iters, padded_dim - dim), 0x7F7F7F7F, dtype=scale_iter.dtype, device=scale_iter.device
+    )
+    return torch.cat([scale_iter, pad], dim=1).contiguous()
 
 
 def make_runner(M, N, K, x_dtype):
@@ -72,22 +166,29 @@ def make_runner(M, N, K, x_dtype):
     device = "cuda"
     k_iters = K // BLOCK_K
 
-    x = torch.randn(M, K, dtype=x_dtype, device=device)
-    w = torch.randn(N, K, dtype=x_dtype, device=device)
+    # HipKittens uses normal(mean=0, std=0.5) for both operands.
+    x = torch.randn(M, K, dtype=x_dtype, device=device) * 0.5
+    w = torch.randn(N, K, dtype=x_dtype, device=device) * 0.5
     x_q, x_scale = mxfp8_e4m3_quantize(x)  # [M,K] fp8, [M,K//32] u8
     w_q, w_scale = mxfp8_e4m3_quantize(w)  # [N,K] fp8, [N,K//32] u8
     x_q, w_q = x_q.contiguous(), w_q.contiguous()
 
     # Iteration-major packed scales [k_iters, dim] uint32, repacked on-device
-    # into the MFMA layout by the repack launcher.
+    # into the MFMA layout by the repack launcher. The repack interleaves 4 rows
+    # 64 apart into one word, so the scale row count must be padded to a multiple
+    # of 64; padding rows hold the packed E8M0 identity scale 0x7F7F7F7F (= 1.0).
+    sa_dim = ((M + 63) // 64) * 64
+    sb_dim = ((N + 63) // 64) * 64
     sa_iter = pack_scales_iter_major(x_scale.contiguous(), k_iters)  # [k_iters, M]
     sb_iter = pack_scales_iter_major(w_scale.contiguous(), k_iters)  # [k_iters, N]
+    sa_iter = _pad_scale_rows(sa_iter, sa_dim)  # [k_iters, sa_dim]
+    sb_iter = _pad_scale_rows(sb_iter, sb_dim)  # [k_iters, sb_dim]
     sa_mfma = torch.empty_like(sa_iter)
     sb_mfma = torch.empty_like(sb_iter)
 
     c_out = torch.empty((M, N), dtype=torch.bfloat16, device=device)
 
-    launch_gemm, launch_repack = compile_mxfp8_gemm_4w(M=M, N=N, K=K)
+    launch_gemm, launch_repack = compile_mxfp8_gemm_4w(K=K)
     stream = torch.cuda.current_stream()
 
     def _gemm_args():
@@ -97,14 +198,16 @@ def make_runner(M, N, K, x_dtype):
             c_out.view(-1),
             sa_mfma,
             sb_mfma,
+            M, N,
+            sa_dim, sb_dim,
             stream,
         )
 
     def _repack_a_args():
-        return (sa_iter, sa_mfma, M, k_iters, stream)
+        return (sa_iter, sa_mfma, sa_dim, k_iters, stream)
 
     def _repack_b_args():
-        return (sb_iter, sb_mfma, N, k_iters, stream)
+        return (sb_iter, sb_mfma, sb_dim, k_iters, stream)
 
     repack_a = flyc.compile(launch_repack, *_repack_a_args())
     repack_b = flyc.compile(launch_repack, *_repack_b_args())
@@ -115,36 +218,107 @@ def make_runner(M, N, K, x_dtype):
         repack_b(*_repack_b_args())
         gemm(*_gemm_args())
 
-    # Reference from the dequantized fp8 inputs (matches what the kernel sees).
-    x_deq = mxfp8_dequantize(x_q, x_scale)  # [M, K]
-    w_deq = mxfp8_dequantize(w_q, w_scale)  # [N, K]
-    c_ref = (x_deq @ w_deq.t()).to(torch.float32)
+    # Reference from the Triton tl.dot_scaled kernel on the *same* quantized
+    # fp8 inputs + E8M0 scales the GEMM consumes.
+    c_ref = triton_mxfp8_reference(x_q, x_scale, w_q, w_scale, M, N, K)
+
+    def run_triton():
+        triton_mxfp8_reference(x_q, x_scale, w_q, w_scale, M, N, K)
 
     # Verify accuracy before handing back the benchmark closure.
     run()
     torch.cuda.synchronize()
-    assert verify_output(c_out.to(torch.float32), c_ref, rtol=0.1, atol=0.1)
+    assert verify_output(c_out.to(torch.float32), c_ref.to(torch.float32), atol=0.1, rtol=0.1)
 
-    return run
+    return run, run_triton
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("-M", type=int, default=8192)
-    ap.add_argument("-N", type=int, default=8192)
-    ap.add_argument("-K", type=int, default=8192)
-    args = ap.parse_args()
-
-    M, N, K = args.M, args.N, args.K
-
-    run = make_runner(M, N, K, torch.bfloat16)
-
-    us = triton.testing.do_bench(run) * 1e3
-    tflops = 2 * M * N * K / (us * 1e-6) / 1e12
-
-    print(f"{'shape (MxNxK)':>18} {'dtype':>10} {'latency(us)':>12} {'TFLOPS':>9}")
-    print(f"{f'{M}x{N}x{K}':>18} {args.dtype:>10} {us:>12.2f} {tflops:>9.2f}")
+# (m, n, k) shapes to sweep.
+SHAPES = [
+    (3, 6144, 2048),
+    (3, 2560, 6144),
+    (3, 1536, 6144),
+    (3, 6144, 768),
+    (2, 6144, 2048),
+    (2, 2560, 6144),
+    (2, 1536, 6144),
+    (2, 6144, 768),
+    (4, 6144, 2048),
+    (1, 6144, 2048),
+    (4, 2560, 6144),
+    (4, 1536, 6144),
+    (4, 6144, 768),
+    (1, 2560, 6144),
+    (1, 1536, 6144),
+    (1, 6144, 768),
+    (1024, 6144, 2048),
+    (2268, 6144, 2048),
+    (357, 6144, 2048),
+    (137, 6144, 2048),
+    (164, 6144, 2048),
+    (117, 6144, 2048),
+    (8192, 2560, 6144),
+    (8192, 1536, 6144),
+    (8192, 6144, 768),
+    (1024, 2560, 6144),
+    (1024, 1536, 6144),
+    (1024, 6144, 768),
+    (2268, 2560, 6144),
+    (2268, 1536, 6144),
+    (2268, 6144, 768),
+    (357, 2560, 6144),
+    (357, 1536, 6144),
+    (357, 6144, 768),
+    (137, 2560, 6144),
+    (137, 1536, 6144),
+    (137, 6144, 768),
+    (164, 2560, 6144),
+    (164, 1536, 6144),
+    (164, 6144, 768),
+    (117, 2560, 6144),
+    (117, 1536, 6144),
+    (117, 6144, 768),
+    (3, 2304, 6144),
+    (3, 6144, 6144),
+    (3, 6144, 3072),
+    (8192, 2304, 6144),
+    (8192, 6144, 6144),
+    (8192, 6144, 3072),
+    (1024, 2304, 6144),
+    (1024, 6144, 6144),
+    (1024, 6144, 3072),
+]
 
 
 if __name__ == "__main__":
-    main()
+    header = (
+        f"{'shape (MxNxK)':>18} {'dtype':>10} {'latency FlyDSL(us)':>20} {'TFLOPS FlyDSL':>15}"
+        f" {'latency Triton(us)':>20} {'TFLOPS Triton':>15}"
+    )
+    print(header)
+
+    failed = []
+    for M, N, K in SHAPES:
+        try:
+            run, run_triton = make_runner(M, N, K, torch.bfloat16)
+        except AssertionError:
+            failed.append((M, N, K))
+            continue
+
+        flops = 2 * M * N * K
+
+        us = triton.testing.do_bench(run) * 1e3
+        tflops = flops / (us * 1e-6) / 1e12
+
+        us_tt = triton.testing.do_bench(run_triton) * 1e3
+        tflops_tt = flops / (us_tt * 1e-6) / 1e12
+
+        print(
+            f"{f'{M}x{N}x{K}':>18} {'bfloat16':>10} {us:>20.2f} {tflops:>15.2f}"
+            f" {us_tt:>20.2f} {tflops_tt:>15.2f}"
+        )
+
+    if failed:
+        print(f"\n{len(failed)} shape(s) failed the correctness check (skipped above):")
+        for M, N, K in failed:
+            print(f"  {M}x{N}x{K}")

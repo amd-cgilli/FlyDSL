@@ -3,23 +3,19 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import buffer_ops, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
+from kernels.fp8_gemm_utils import ceildiv
 
 
 def compile_mxfp8_gemm_4w(
     *,
-    M: int,
-    N: int,
     K: int,
 ):
     BLOCK_M = 256
     BLOCK_N = 256
     BLOCK_K = 128
 
-    N_BLOCKS = N // BLOCK_N
     K_ITERS = K // BLOCK_K
 
-    assert N % BLOCK_N == 0
-    assert M % BLOCK_M == 0
     assert K % BLOCK_K == 0
 
     @flyc.kernel
@@ -27,8 +23,12 @@ def compile_mxfp8_gemm_4w(
         A: fx.Pointer,
         B_T: fx.Pointer,
         C: fx.Pointer,
-        A_scales: fx.Pointer, # [M, K//32]
-        B_scales: fx.Pointer, # [N, K//32]
+        A_scales: fx.Pointer, # [sa_dim, K//32] packed, sa_dim padded to mult of 64
+        B_scales: fx.Pointer, # [sb_dim, K//32] packed, sb_dim padded to mult of 64
+        c_m: fx.Int32,
+        c_n: fx.Int32,
+        sa_dim: fx.Int32,
+        sb_dim: fx.Int32,
     ):
         MfmaAccumType_t = Vec.make_type(4, fx.Float32)
         RT_C_i = Vec.filled(4, 0.0, fx.Float32)
@@ -53,8 +53,9 @@ def compile_mxfp8_gemm_4w(
         lane_id = fx.thread_idx.x % 64
         wave_id = fx.thread_idx.x // 64
 
-        tile_i = fx.block_idx.x // N_BLOCKS
-        tile_j = fx.block_idx.x % N_BLOCKS
+        n_blocks = ceildiv(c_n, BLOCK_N)
+        tile_i = fx.block_idx.x // n_blocks
+        tile_j = fx.block_idx.x % n_blocks
         wave_i = wave_id // 2
         wave_j = wave_id % 2
         A0_gl_offset = (tile_i * BLOCK_M) * K
@@ -67,9 +68,15 @@ def compile_mxfp8_gemm_4w(
         b_row_h0 = wave_j * 64
         b_row_h1 = 128 + b_row_h0
 
-        A_rsrc = buffer_ops.create_buffer_resource(A)
-        B_rsrc = buffer_ops.create_buffer_resource(B_T)
-        C_rsrc = buffer_ops.create_buffer_resource(C)
+        A_rsrc = buffer_ops.create_buffer_resource(A, max_size=False, num_records_bytes=c_m * K)
+        B_rsrc = buffer_ops.create_buffer_resource(B_T, max_size=False, num_records_bytes=c_n * K)
+        C_rsrc = buffer_ops.create_buffer_resource(C, max_size=False, num_records_bytes=c_m * c_n * 2)
+        A_scales_rsrc = buffer_ops.create_buffer_resource(
+            A_scales, max_size=False, num_records_bytes=K_ITERS * sa_dim * 4
+        )
+        B_scales_rsrc = buffer_ops.create_buffer_resource(
+            B_scales, max_size=False, num_records_bytes=K_ITERS * sb_dim * 4
+        )
 
         def _swizzle_128(row, col):
             offset = row * 128 + col
@@ -138,7 +145,7 @@ def compile_mxfp8_gemm_4w(
                     vec_bf16 = Vec(c_frag[ti][tj]).to(fx.BFloat16)
                     for i in range_constexpr(4):
                         buffer_ops.buffer_store(
-                            vec_bf16[i], C_rsrc, fx.Int32((row + i) * N + col)
+                            vec_bf16[i], C_rsrc, fx.Int32((row + i) * c_n + col)
                         )
 
         def _mfma_ABt_all(a, b, c, a_scales, b_scales):
@@ -146,7 +153,7 @@ def compile_mxfp8_gemm_4w(
                 for j in range_constexpr(4):
                     c[i][j] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
                         MfmaAccumType_t,
-                        [a[i], b[j], c[i][j], 0, 0, 0, a_scales, 0, b_scales],
+                        [a[i], b[j], c[i][j], 0, 0, i, a_scales, j, b_scales],
                     )
             return c
 
@@ -158,6 +165,12 @@ def compile_mxfp8_gemm_4w(
                 constraints="",
                 has_side_effects=True,
             )
+
+        def _load_scales(gl_src, row, dim, k):
+            # dim is the packed-scale row stride, padded to a multiple of 64 and
+            # prefilled with the E8M0 identity scale 0x7F so partial M/N tiles
+            # read 1.0 for their out-of-range rows.
+            return buffer_ops.buffer_load(gl_src, fx.Int32(k * dim + row), vec_width=1, dtype=fx.Uint32)
 
         c00_frag = [[RT_C_i for _ in range_constexpr(4)] for _ in range_constexpr(4)]
         c01_frag = [[RT_C_i for _ in range_constexpr(4)] for _ in range_constexpr(4)]
@@ -188,10 +201,10 @@ def compile_mxfp8_gemm_4w(
 
         cur, next = 0, 1
         for k in range_constexpr(K_ITERS - 2):
-            sa_h0 = A_scales[k, tile_i + a_row_h0 + lane_id]
-            sb_h0 = B_scales[k, tile_j + b_row_h0 + lane_id]
-            sa_h1 = A_scales[k, tile_i + a_row_h1 + lane_id]
-            sb_h1 = B_scales[k, tile_j + b_row_h1 + lane_id]
+            sa_h0 = _load_scales(A_scales_rsrc, tile_i * BLOCK_M + a_row_h0 + lane_id, sa_dim, k)
+            sb_h0 = _load_scales(B_scales_rsrc, tile_j * BLOCK_N + b_row_h0 + lane_id, sb_dim, k)
+            sa_h1 = _load_scales(A_scales_rsrc, tile_i * BLOCK_M + a_row_h1 + lane_id, sa_dim, k)
+            sb_h1 = _load_scales(B_scales_rsrc, tile_j * BLOCK_N + b_row_h1 + lane_id, sb_dim, k)
 
             _wait_barrier(16)
 
@@ -220,10 +233,10 @@ def compile_mxfp8_gemm_4w(
         # step k = k_iters - 2
         _wait_barrier(16)
         k = K_ITERS - 2
-        sa_h0 = A_scales[k, tile_i + a_row_h0 + lane_id]
-        sb_h0 = B_scales[k, tile_j + b_row_h0 + lane_id]
-        sa_h1 = A_scales[k, tile_i + a_row_h1 + lane_id]
-        sb_h1 = B_scales[k, tile_j + b_row_h1 + lane_id]
+        sa_h0 = _load_scales(A_scales_rsrc, tile_i * BLOCK_M + a_row_h0 + lane_id, sa_dim, k)
+        sb_h0 = _load_scales(B_scales_rsrc, tile_j * BLOCK_N + b_row_h0 + lane_id, sb_dim, k)
+        sa_h1 = _load_scales(A_scales_rsrc, tile_i * BLOCK_M + a_row_h1 + lane_id, sa_dim, k)
+        sb_h1 = _load_scales(B_scales_rsrc, tile_j * BLOCK_N + b_row_h1 + lane_id, sb_dim, k)
 
         b1_frag = _load_rt(B_lds[cur][1], wave_j)
         _mfma_ABt_all(a0_frag, b0_frag, c00_frag, sa_h0, sb_h0)
@@ -245,9 +258,10 @@ def compile_mxfp8_gemm_4w(
         # step k = k_iters - 1
         _wait_barrier(0)
         k = K_ITERS - 1
-
-        base_row = tile_i * BLOCK_M + wave_i * 64
-        base_col = tile_j * BLOCK_N + wave_j * 64
+        sa_h0 = _load_scales(A_scales_rsrc, tile_i * BLOCK_M + a_row_h0 + lane_id, sa_dim, k)
+        sb_h0 = _load_scales(B_scales_rsrc, tile_j * BLOCK_N + b_row_h0 + lane_id, sb_dim, k)
+        sa_h1 = _load_scales(A_scales_rsrc, tile_i * BLOCK_M + a_row_h1 + lane_id, sa_dim, k)
+        sb_h1 = _load_scales(B_scales_rsrc, tile_j * BLOCK_N + b_row_h1 + lane_id, sb_dim, k)
 
         b1_frag = _load_rt(B_lds[cur][1], wave_j)
         _mfma_ABt_all(a0_frag, b0_frag, c00_frag, sa_h0, sb_h0)
@@ -258,20 +272,25 @@ def compile_mxfp8_gemm_4w(
         _mfma_ABt_all(a1_frag, b0_frag, c10_frag, sa_h1, sb_h0)
         _mfma_ABt_all(a1_frag, b1_frag, c11_frag, sa_h1, sb_h1)
 
+        base_row = tile_i * BLOCK_M + wave_i * 64
+        base_col = tile_j * BLOCK_N + wave_j * 64
+
         _store_rt(c00_frag, base_row + 0, base_col + 0)
         _store_rt(c01_frag, base_row + 0, base_col + 128)
         _store_rt(c10_frag, base_row + 128, base_col + 0)
         _store_rt(c11_frag, base_row + 128, base_col + 128)
 
     @flyc.jit
-    def launch_gemm(A: fx.Pointer, B_T: fx.Pointer, C: fx.Pointer, A_scales: fx.Pointer, B_scales: fx.Pointer, stream: fx.Stream):
-        grid_x = (M * N) // (256 * 256)
+    def launch_gemm(A: fx.Pointer, B_T: fx.Pointer, C: fx.Pointer, A_scales: fx.Pointer, B_scales: fx.Pointer, c_m: fx.Int32, c_n: fx.Int32, sa_dim: fx.Int32, sb_dim: fx.Int32, stream: fx.Stream):
+        grid_x = ceildiv(c_m, BLOCK_M) * ceildiv(c_n, BLOCK_N)
         kernel_gemm(
             A,
             B_T,
             C,
             A_scales,
             B_scales,
+            c_m, c_n,
+            sa_dim, sb_dim,
             value_attrs={
                 "rocdl.waves_per_eu": 1,
                 "rocdl.flat_work_group_size": "256,256",
@@ -284,21 +303,29 @@ def compile_mxfp8_gemm_4w(
         if idx >= dim * k_steps:
             return
 
+        scales_rsrc = buffer_ops.create_buffer_resource(scales)
+        scales_rpck_rsrc = buffer_ops.create_buffer_resource(scales_repacked)
+
         ki = idx // dim
         row = idx % dim
         r16 = row % 16
         k_sub = (row // 16) % 4
         tile = row // 64
 
-        packed = 0
+        packed = fx.Uint32(0)
         for g in range_constexpr(4):
             src_row = tile * 64 + g * 16 + r16
+            # Empty/OOB blocks default to the E8M0 identity scale 0x7F (2**0 = 1.0),
+            # not 0x00 (which would be ~2**-127 and corrupt the packed word).
+            byte_val = fx.Uint32(0x7F)
             if src_row < dim:
-                src_val = scales[ki * dim + src_row]
+                src_val = buffer_ops.buffer_load(scales_rsrc, fx.Int32(ki * dim + src_row), vec_width=1, dtype=fx.Uint32)
+                # src_val = scales[ki * dim + src_row]
                 byte_val = (src_val >> (k_sub * 8)) & 0xFF
-                packed = packed | (byte_val << (g * 8))
+            packed = packed | (byte_val << (g * 8))
 
-        scales_repacked[ki * dim + row] = packed
+        buffer_ops.buffer_store(fx.Uint32(packed), scales_rpck_rsrc, fx.Int32(ki * dim + row))
+        # scales_repacked[ki * dim + row] = packed
 
     @flyc.jit
     def launch_repack_scales(scales: fx.Pointer, scales_repacked: fx.Pointer, dim: fx.Int32, k_steps: fx.Int32, stream: fx.Stream):
