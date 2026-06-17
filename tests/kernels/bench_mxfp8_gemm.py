@@ -13,6 +13,7 @@ if _REPO_ROOT not in sys.path:
 
 import flydsl.compiler as flyc
 from kernels.mxfp8_gemm_4w import compile_mxfp8_gemm_4w
+from kernels.mxfp8_gemm_8w import compile_mxfp8_gemm_8w
 from tests.test_common import verify_output
 
 MXFP8_BLOCK_SIZE = 32
@@ -163,26 +164,53 @@ def preshuffle_scales(scale: torch.Tensor, group: int) -> torch.Tensor:
     return s.view(torch.int32).reshape(groups, 16, scale_k)  # little-endian uint32
 
 
-# Block sizes to autotune over for both M and N.
-BLOCK_CHOICES = [64, 128, 256]
-# Set to see why each (block_m, block_n) config is skipped during the sweep.
+# Set to see why each config is skipped during the sweep.
 VERBOSE_AUTOTUNE = bool(int(os.environ.get("VERBOSE_AUTOTUNE", "0")))
 
+# Block sizes to autotune over, keyed by number of waves.
+BLOCK_CONFIG = {
+    4: {
+        "BLOCK_M": [64, 128, 256],
+        "BLOCK_N": [64, 128, 256]
+    },
+    # 8: {
+    #     "BLOCK_M": [128, 256],
+    #     "BLOCK_N": [256]
+    # },
+}
 
-def config_name(block_m, block_n):
-    return f"4w_{block_m}x{block_n}x{BLOCK_K}"
+def config_name(num_waves, block_m, block_n):
+    return f"{num_waves}w_{block_m}x{block_n}x{BLOCK_K}"
 
 
-def _make_config_runner(block_m, block_n, K, x_q, w_q, x_scale, w_scale, M, N):
-    """Build the run closure for one (block_m, block_n) config. Each config needs
-    its own group-specific preshuffled scales, compiled kernel, and output
-    buffer. Returns (run, c_out)."""
+def _scale_groups(num_waves, block_m, block_n):
+    """Scale-pack group sizes (rows packed into one uint32 scale word) = the rows
+    one wave-fragment covers along M/N. A is split across num_waves//4 row-waves
+    and B across num_waves//2 col-waves, but in both kernels GROUP_A = BLOCK_M//4;
+    GROUP_B = BLOCK_N//4 for 4 waves and BLOCK_N//8 for 8 waves."""
+    group_a = block_m // 4
+    group_b = block_n // 4 if num_waves == 4 else block_n // 8
+    return group_a, group_b
+
+
+def _compile_for_waves(num_waves, K, block_m, block_n):
+    if num_waves == 4:
+        return compile_mxfp8_gemm_4w(K=K, BLOCK_M=block_m, BLOCK_N=block_n)
+    # 8-wave kernel fixes BLOCK_N=256 and only varies BLOCK_M.
+    assert block_n == 256
+    return compile_mxfp8_gemm_8w(K=K, BLOCK_M=block_m)
+
+
+def _make_config_runner(num_waves, block_m, block_n, K, x_q, w_q, x_scale, w_scale, M, N):
+    """Build the run closure for one (num_waves, block_m, block_n) config. Each
+    config needs its own group-specific preshuffled scales, compiled kernel, and
+    output buffer. Returns (run, c_out)."""
     device = x_q.device
+    group_a, group_b = _scale_groups(num_waves, block_m, block_n)
     # Preshuffled E8M0 scales [ceil(dim/group), 16, K//32] uint32, packed host-side
-    # so the GEMM loads each scale word with a single padded int32 read. The wave
-    # fragment covers BLOCK//4 rows, which is the scale-pack group size.
-    sa = preshuffle_scales(x_scale.contiguous(), block_m // 4)  # [ceil(M/(BM//4)), 16, K//32]
-    sb = preshuffle_scales(w_scale.contiguous(), block_n // 4)  # [ceil(N/(BN//4)), 16, K//32]
+    # so the GEMM loads each scale word with a single padded int32 read.
+    sa = preshuffle_scales(x_scale.contiguous(), group_a)  # [ceil(M/group_a), 16, K//32]
+    sb = preshuffle_scales(w_scale.contiguous(), group_b)  # [ceil(N/group_b), 16, K//32]
 
     c_out = torch.empty((M, N), dtype=torch.bfloat16, device=device)
     stream = torch.cuda.current_stream()
@@ -198,7 +226,7 @@ def _make_config_runner(block_m, block_n, K, x_q, w_q, x_scale, w_scale, M, N):
             stream,
         )
 
-    launch_gemm = compile_mxfp8_gemm_4w(K=K, BLOCK_M=block_m, BLOCK_N=block_n)
+    launch_gemm = _compile_for_waves(num_waves, K, block_m, block_n)
     gemm = flyc.compile(launch_gemm, *_gemm_args())
 
     def run():
@@ -231,28 +259,29 @@ def make_runner(M, N, K, x_dtype):
     best_run = None
     best_name = None
     best_us = float("inf")
-    for block_m in BLOCK_CHOICES:
-        for block_n in BLOCK_CHOICES:
-            name = config_name(block_m, block_n)
-            try:
-                run, c_out = _make_config_runner(
-                    block_m, block_n, K, x_q, w_q, x_scale, w_scale, M, N
-                )
-                run()
-                torch.cuda.synchronize()
-            except Exception as e:
+    for num_waves, blocks in BLOCK_CONFIG.items():
+        for block_m in blocks["BLOCK_M"]:
+            for block_n in blocks["BLOCK_N"]:
+                name = config_name(num_waves, block_m, block_n)
+                try:
+                    run, c_out = _make_config_runner(
+                        num_waves, block_m, block_n, K, x_q, w_q, x_scale, w_scale, M, N
+                    )
+                    run()
+                    torch.cuda.synchronize()
+                except Exception as e:
+                    if VERBOSE_AUTOTUNE:
+                        print(f"    [{name}] compile/run error: {e}")
+                    continue
+                if not verify_output(c_out.to(torch.float32), c_ref, atol=0.1, rtol=0.1):
+                    if VERBOSE_AUTOTUNE:
+                        print(f"    [{name}] failed correctness check")
+                    continue
+                us = triton.testing.do_bench(run) * 1e3
                 if VERBOSE_AUTOTUNE:
-                    print(f"    [{name}] compile/run error: {e}")
-                continue
-            if not verify_output(c_out.to(torch.float32), c_ref, atol=0.1, rtol=0.1):
-                if VERBOSE_AUTOTUNE:
-                    print(f"    [{name}] failed correctness check")
-                continue
-            us = triton.testing.do_bench(run) * 1e3
-            if VERBOSE_AUTOTUNE:
-                print(f"    [{name}] ok, {us:.2f} us")
-            if us < best_us:
-                best_us, best_run, best_name = us, run, name
+                    print(f"    [{name}] ok, {us:.2f} us")
+                if us < best_us:
+                    best_us, best_run, best_name = us, run, name
 
     if best_run is None:
         raise AssertionError("no config passed the correctness check")
@@ -260,60 +289,25 @@ def make_runner(M, N, K, x_dtype):
     return best_run, run_triton, best_name
 
 
-# (m, n, k) shapes to sweep.
-SHAPES = [
-    (3, 6144, 2048),
-    (3, 2560, 6144),
-    (3, 1536, 6144),
-    (3, 6144, 768),
-    (2, 6144, 2048),
-    (2, 2560, 6144),
-    (2, 1536, 6144),
-    (2, 6144, 768),
-    (4, 6144, 2048),
-    (1, 6144, 2048),
-    (4, 2560, 6144),
-    (4, 1536, 6144),
-    (4, 6144, 768),
-    (1, 2560, 6144),
-    (1, 1536, 6144),
-    (1, 6144, 768),
-    (1024, 6144, 2048),
-    (2268, 6144, 2048),
-    (357, 6144, 2048),
-    (137, 6144, 2048),
-    (164, 6144, 2048),
-    (117, 6144, 2048),
-    (8192, 2560, 6144),
-    (8192, 1536, 6144),
-    (8192, 6144, 768),
-    (1024, 2560, 6144),
-    (1024, 1536, 6144),
-    (1024, 6144, 768),
-    (2268, 2560, 6144),
-    (2268, 1536, 6144),
-    (2268, 6144, 768),
-    (357, 2560, 6144),
-    (357, 1536, 6144),
-    (357, 6144, 768),
-    (137, 2560, 6144),
-    (137, 1536, 6144),
-    (137, 6144, 768),
-    (164, 2560, 6144),
-    (164, 1536, 6144),
-    (164, 6144, 768),
-    (117, 2560, 6144),
-    (117, 1536, 6144),
-    (117, 6144, 768),
-    (3, 2304, 6144),
-    (3, 6144, 6144),
-    (3, 6144, 3072),
-    (8192, 2304, 6144),
-    (8192, 6144, 6144),
-    (8192, 6144, 3072),
-    (1024, 2304, 6144),
-    (1024, 6144, 6144),
-    (1024, 6144, 3072),
+# (n, k) shapes to sweep.
+TP8_SHAPES = [
+    (1280, 6144),
+    (6144, 1024),
+    (3072, 6144),
+    (6144, 1536),
+    (1536, 6144),
+    (768, 6144),
+    (6144, 384),
+]
+
+TP4_SHAPES = [
+    (2304, 6144),
+    (6144, 2048),
+    (6144, 6144),
+    (6144, 3072),
+    (2560, 6144),
+    (1536, 6144),
+    (6144, 768),
 ]
 
 
@@ -325,26 +319,28 @@ if __name__ == "__main__":
     print(header)
 
     failed = []
-    for M, N, K in SHAPES:
-        try:
-            run, run_triton, best_config = make_runner(M, N, K, torch.bfloat16)
-        except AssertionError:
-            failed.append((M, N, K))
-            continue
+    for N, K in TP4_SHAPES:
+        # Focus only on decode shapes
+        for M in [4,8,16,32,64,128]:
+            try:
+                run, run_triton, best_config = make_runner(M, N, K, torch.bfloat16)
+            except AssertionError:
+                failed.append((M, N, K))
+                continue
 
-        flops = 2 * M * N * K
+            flops = 2 * M * N * K
 
-        us = triton.testing.do_bench(run) * 1e3
-        tflops = flops / (us * 1e-6) / 1e12
+            us = triton.testing.do_bench(run) * 1e3
+            tflops = flops / (us * 1e-6) / 1e12
 
-        us_tt = triton.testing.do_bench(run_triton) * 1e3
-        tflops_tt = flops / (us_tt * 1e-6) / 1e12
+            us_tt = triton.testing.do_bench(run_triton) * 1e3
+            tflops_tt = flops / (us_tt * 1e-6) / 1e12
 
-        speedup = us_tt / us
-        print(
-            f"{f'{M}x{N}x{K}':>18} {best_config:>16} {us:>20.2f} {tflops:>15.2f}"
-            f" {us_tt:>20.2f} {tflops_tt:>15.2f} {speedup:>10.2f}x"
-        )
+            speedup = us_tt / us
+            print(
+                f"{f'{M}x{N}x{K}':>18} {best_config:>16} {us:>20.2f} {tflops:>15.2f}"
+                f" {us_tt:>20.2f} {tflops_tt:>15.2f} {speedup:>10.2f}x"
+            )
 
     if failed:
         print(f"\n{len(failed)} shape(s) failed the correctness check (skipped above):")
