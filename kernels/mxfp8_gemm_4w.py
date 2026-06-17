@@ -294,11 +294,11 @@ def compile_mxfp8_gemm_4w(
         for g in range_constexpr(4):
             src_row = tile * 64 + g * 16 + r16
             if src_row < dim:
-                src_val = scales[ki, src_row]
+                src_val = scales[ki * dim + src_row]
                 byte_val = (src_val >> (k_sub * 8)) & 0xFF
                 packed = packed | (byte_val << (g * 8))
 
-        scales_repacked[ki, row] = packed
+        scales_repacked[ki * dim + row] = packed
 
     @flyc.jit
     def launch_repack_scales(scales: fx.Pointer, scales_repacked: fx.Pointer, dim: fx.Int32, k_steps: fx.Int32, stream: fx.Stream):
