@@ -131,40 +131,9 @@ def mxfp8_dequantize(q: torch.Tensor, e8m0: torch.Tensor) -> torch.Tensor:
     return (qf * scale.unsqueeze(-1)).reshape(dim, k)
 
 
-def pack_scales_iter_major(scale_raw: torch.Tensor, k_iters: int) -> torch.Tensor:
-    """Pack [dim, K//32] uint8 E8M0 scales into iteration-major [k_iters, dim] uint32.
-
-    Each iteration covers BLOCK_K=128 K-elements = 4 blocks of 32, so the 4
-    consecutive uint8 block scales are packed little-endian into one uint32.
-    """
-    dim, scale_k = scale_raw.shape
-    assert scale_k == k_iters * 4, (scale_k, k_iters)
-    s = scale_raw.to(torch.int64).reshape(dim, k_iters, 4)
-    shift = torch.arange(4, device=s.device, dtype=torch.int64) * 8
-    packed = (s << shift).sum(dim=-1)  # [dim, k_iters]
-    return packed.t().contiguous().to(torch.uint32)  # [k_iters, dim]
-
-
-def _pad_scale_rows(scale_iter: torch.Tensor, padded_dim: int) -> torch.Tensor:
-    """Pad [k_iters, dim] packed-uint32 scales out to ``padded_dim`` rows.
-
-    Padding rows hold 0x7F7F7F7F, the packed E8M0 identity scale (four bytes of
-    exponent 127 = 2**0 = 1.0), so out-of-range rows of a partial tile contribute
-    a scale of 1.0.
-    """
-    k_iters, dim = scale_iter.shape
-    if padded_dim == dim:
-        return scale_iter
-    pad = torch.full(
-        (k_iters, padded_dim - dim), 0x7F7F7F7F, dtype=scale_iter.dtype, device=scale_iter.device
-    )
-    return torch.cat([scale_iter, pad], dim=1).contiguous()
-
-
 def make_runner(M, N, K, x_dtype):
     assert K % BLOCK_K == 0
     device = "cuda"
-    k_iters = K // BLOCK_K
 
     # HipKittens uses normal(mean=0, std=0.5) for both operands.
     x = torch.randn(M, K, dtype=x_dtype, device=device) * 0.5
@@ -173,22 +142,15 @@ def make_runner(M, N, K, x_dtype):
     w_q, w_scale = mxfp8_e4m3_quantize(w)  # [N,K] fp8, [N,K//32] u8
     x_q, w_q = x_q.contiguous(), w_q.contiguous()
 
-    # Iteration-major packed scales [k_iters, dim] uint32, repacked on-device
-    # into the MFMA layout by the repack launcher. The repack interleaves 4 rows
-    # 64 apart into one word, so the scale row count must be padded to a multiple
-    # of 64; padding rows hold the packed E8M0 identity scale 0x7F7F7F7F (= 1.0).
-    sa_dim = ((M + 63) // 64) * 64
-    sb_dim = ((N + 63) // 64) * 64
-    sa_iter = pack_scales_iter_major(x_scale.contiguous(), k_iters)  # [k_iters, M]
-    sb_iter = pack_scales_iter_major(w_scale.contiguous(), k_iters)  # [k_iters, N]
-    sa_iter = _pad_scale_rows(sa_iter, sa_dim)  # [k_iters, sa_dim]
-    sb_iter = _pad_scale_rows(sb_iter, sb_dim)  # [k_iters, sb_dim]
-    sa_mfma = torch.empty_like(sa_iter)
-    sb_mfma = torch.empty_like(sb_iter)
+    # Unpacked E8M0 (uint8) block scales [dim, K//32] consumed directly by the
+    # GEMM; the kernel now gathers and packs the 4 MFMA scale bytes on-device, so
+    # no pre-pack pass and no row padding is needed.
+    sa = x_scale.contiguous()  # [M, K//32]
+    sb = w_scale.contiguous()  # [N, K//32]
 
     c_out = torch.empty((M, N), dtype=torch.bfloat16, device=device)
 
-    launch_gemm, launch_repack = compile_mxfp8_gemm_4w(K=K)
+    launch_gemm = compile_mxfp8_gemm_4w(K=K)
     stream = torch.cuda.current_stream()
 
     def _gemm_args():
@@ -196,26 +158,15 @@ def make_runner(M, N, K, x_dtype):
             x_q.view(-1),
             w_q.view(-1),
             c_out.view(-1),
-            sa_mfma,
-            sb_mfma,
+            sa,
+            sb,
             M, N,
-            sa_dim, sb_dim,
             stream,
         )
 
-    def _repack_a_args():
-        return (sa_iter, sa_mfma, sa_dim, k_iters, stream)
-
-    def _repack_b_args():
-        return (sb_iter, sb_mfma, sb_dim, k_iters, stream)
-
-    repack_a = flyc.compile(launch_repack, *_repack_a_args())
-    repack_b = flyc.compile(launch_repack, *_repack_b_args())
     gemm = flyc.compile(launch_gemm, *_gemm_args())
 
     def run():
-        repack_a(*_repack_a_args())
-        repack_b(*_repack_b_args())
         gemm(*_gemm_args())
 
     # Reference from the Triton tl.dot_scaled kernel on the *same* quantized
