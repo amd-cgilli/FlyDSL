@@ -3,10 +3,11 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import buffer_ops, const_expr, range_constexpr, rocdl
+from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from kernels.fp8_gemm_utils import ceildiv, divmod, wait_barrier, xcd_swizzle
-
+from flydsl._mlir.dialects import llvm as _llvm
+from flydsl.expr.typing import T as _T
 
 def compile_bf16_gemm_16x32_4w(
     *,
@@ -210,12 +211,22 @@ def compile_bf16_gemm_16x32_4w(
                         )
             return c
 
+        def _do_mfma(a, b, c):
+            a_i32x4 = a.bitcast(fx.Int32)
+            b_i32x4 = b.bitcast(fx.Int32)
+            res_ty = _T.vec(4, _T.f32)
+            res = _llvm.inline_asm(
+                res_ty,
+                [arith._to_raw(a_i32x4), arith._to_raw(b_i32x4), arith._to_raw(c)],
+                "v_mfma_f32_16x16x32_bf16 $0, $1, $2, $0",
+                "=a,v,v,0",
+                has_side_effects=True,
+            )
+            return Vec(res)
+
         def _mfma_one(a, b, c, i, j):
             for k in range_constexpr(2):
-                c[i][j] = rocdl.mfma_f32_16x16x32_bf16(
-                    Accum_t,
-                    [a[i][k], b[j][k], c[i][j], 0, 0, 0]
-                )
+                c[i][j] = _do_mfma(a[i][k], b[j][k], c[i][j])
             return c
 
         def _store_rt():
